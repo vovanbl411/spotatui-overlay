@@ -1,0 +1,231 @@
+name: Prepare spotatui release
+
+on:
+  schedule:
+    # Ежедневно в 05:23 UTC; расписание GitHub Actions задаётся только в UTC.
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Показать план без скачивания исходников, ветки, commit и PR"
+        required: false
+        default: false
+        type: boolean
+
+# Права задаются отдельно для каждого job.
+permissions: {}
+
+concurrency:
+  group: spotatui-release-preparation
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Discover, prepare and validate candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      publish_ready: ${{ steps.ready.outputs.publish_ready }}
+      base_commit: ${{ steps.base.outputs.base_commit }}
+    env:
+      DRY_RUN: ${{ inputs.dry_run || false }}
+      GENTOO_PORTAGE_IMAGE: gentoo/portage@sha256:ce69e5b771bfe9404731e846b835346c34f2c82817ac3626f13af198689a1961
+      GENTOO_STAGE3_IMAGE: gentoo/stage3@sha256:d8536e52677e3efe4caf048ca588bc685bc2d24d7fdfc882de1cdc6d38c81d96
+    steps:
+      - name: Получить main без сохранения credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Зафиксировать базовый commit
+        id: base
+        run: echo "base_commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Проверить Python-логику
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_*.py' -v
+
+      - name: Найти stable release и проверить повторную обработку
+        id: discovery
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          args=()
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          python3 scripts/release_automation.py discover \
+            --root "$GITHUB_WORKSPACE" \
+            --repository "$GITHUB_REPOSITORY" \
+            --result "$RUNNER_TEMP/release.json" \
+            --summary "$GITHUB_STEP_SUMMARY" \
+            --github-output "$GITHUB_OUTPUT" \
+            "${args[@]}"
+
+      - name: Подготовить кандидат и выполнить Gentoo проверки
+        if: steps.discovery.outputs.outcome == 'release-available' && env.DRY_RUN != 'true'
+        env:
+          RELEASE_TAG: ${{ steps.discovery.outputs.release_tag }}
+          BASE_COMMIT: ${{ steps.base.outputs.base_commit }}
+        run: |
+          set -eu
+          docker create --name gentoo-portage "$GENTOO_PORTAGE_IMAGE" /bin/true
+          cleanup() { docker rm -f gentoo-portage >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          docker run --rm --volumes-from gentoo-portage \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/overlay,readonly" \
+            --mount "type=bind,src=$RUNNER_TEMP,dst=/runner-temp" \
+            --workdir /overlay \
+            --env RELEASE_TAG --env BASE_COMMIT \
+            --env GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
+            "$GENTOO_STAGE3_IMAGE" /bin/bash -e -c '
+              emerge --oneshot app-portage/pycargoebuild dev-util/pkgcheck
+              python3 /overlay/scripts/release_automation.py prepare \
+                --root /overlay --result /runner-temp/release.json \
+                --output /runner-temp/candidate --base-commit "$BASE_COMMIT"
+              DISTDIR=/runner-temp/candidate-work/distfiles \
+                ebuild "/runner-temp/candidate/media-sound/spotatui/spotatui-${RELEASE_TAG#v}.ebuild" manifest
+              python3 /overlay/scripts/release_automation.py check-manifest --root /runner-temp/candidate
+              pkgcheck scan --repo /runner-temp/candidate \
+                --profile default/linux/amd64/23.0 --exit
+              chown -R "$(stat -c %u /overlay):$(stat -c %g /overlay)" /runner-temp/candidate
+            '
+          mkdir -p "$RUNNER_TEMP/release-handoff/media-sound/spotatui"
+          cp "$RUNNER_TEMP/candidate/README.md" "$RUNNER_TEMP/release-handoff/README.md"
+          cp "$RUNNER_TEMP/candidate/media-sound/spotatui/Manifest" "$RUNNER_TEMP/release-handoff/media-sound/spotatui/Manifest"
+          cp "$RUNNER_TEMP/candidate/media-sound/spotatui/spotatui-${RELEASE_TAG#v}.ebuild" "$RUNNER_TEMP/release-handoff/media-sound/spotatui/"
+          cp "$RUNNER_TEMP/candidate/release-handoff.json" "$RUNNER_TEMP/release-handoff/release-handoff.json"
+          echo "publish_ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Загрузить только подготовленные package-файлы
+        if: steps.discovery.outputs.outcome == 'release-available' && env.DRY_RUN != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: spotatui-release-handoff
+          path: ${{ runner.temp }}/release-handoff
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Отметить handoff готовым
+        id: ready
+        if: steps.discovery.outputs.outcome == 'release-available' && env.DRY_RUN != 'true'
+        run: echo "publish_ready=true" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Publish Draft PR
+    needs: prepare
+    if: needs.prepare.outputs.publish_ready == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Получить актуальный main без сохранения credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Скачать handoff текущего запуска
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: spotatui-release-handoff
+          path: ${{ runner.temp }}/release-handoff
+
+      - name: Проверить base commit и применить allowlisted handoff
+        id: apply
+        env:
+          EXPECTED_BASE: ${{ needs.prepare.outputs.base_commit }}
+        run: |
+          set -eu
+          test "$(git rev-parse HEAD)" = "$EXPECTED_BASE" || {
+            echo "main moved after preparation; refusing to publish stale candidate" >&2
+            exit 1
+          }
+          python3 scripts/release_automation.py apply \
+            --root "$GITHUB_WORKSPACE" \
+            --handoff "$RUNNER_TEMP/release-handoff" \
+            --expected-base "$EXPECTED_BASE" \
+            --pull-request-request "$RUNNER_TEMP/pull-request.json" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Проверить допустимый список изменений
+        env:
+          HANDOFF_METADATA: ${{ runner.temp }}/release-handoff/release-handoff.json
+        run: |
+          set -eu
+          git diff --check
+          python3 - "$RUNNER_TEMP/pull-request.json" <<'PY'
+          import json, pathlib, subprocess, sys
+          request = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          version = request["head"].removeprefix("automation/spotatui-v")
+          expected = {
+              "README.md",
+              "media-sound/spotatui/Manifest",
+              f"media-sound/spotatui/spotatui-{version}.ebuild",
+          }
+          actual = set(subprocess.check_output(["git", "diff", "--name-only"], text=True).splitlines())
+          untracked = set(subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard"], text=True).splitlines())
+          actual |= untracked
+          removed = set(subprocess.check_output(["git", "diff", "--name-only", "--diff-filter=D"], text=True).splitlines())
+          metadata = json.loads(pathlib.Path(__import__("os").environ["HANDOFF_METADATA"]).read_text())
+          if metadata.get("removed"):
+              expected.add("media-sound/spotatui/" + metadata["removed"])
+          if actual != expected:
+              raise SystemExit(f"Unexpected prepared file set: {sorted(actual ^ expected)}")
+          if removed != ({"media-sound/spotatui/" + metadata["removed"]} if metadata.get("removed") else set()):
+              raise SystemExit("Unexpected ebuild deletion in prepared diff")
+          PY
+
+      - name: Создать automation branch и commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.apply.outputs.branch }}
+          RELEASE_TAG: ${{ steps.apply.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads "https://github.com/${GITHUB_REPOSITORY}.git" "$BRANCH" >/dev/null 2>&1; then
+            echo "Automation branch already exists; refusing to overwrite it" >&2
+            exit 1
+          fi
+          pr_count="$(gh pr list --state all --head "$GITHUB_REPOSITORY_OWNER:$BRANCH" --json number --jq 'length')"
+          if [ "$pr_count" -gt 0 ]; then
+            echo "A pull request already exists for this release" >&2
+            exit 1
+          fi
+          git switch --create "$BRANCH"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md media-sound/spotatui
+          git diff --cached --check
+          git diff --cached --quiet && exit 1
+          git commit -m "update: spotatui ${RELEASE_TAG}"
+          askpass="$RUNNER_TEMP/git-askpass.sh"
+          cat > "$askpass" <<'SH'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "$GH_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          SH
+          chmod 700 "$askpass"
+          GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+            git push "https://github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${BRANCH}"
+
+      - name: Открыть Draft PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Content-Type: application/json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            --data-binary "@$RUNNER_TEMP/pull-request.json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls" \
+            > "$RUNNER_TEMP/pull-request-response.json"
+          python3 -c 'import json, os; print("Draft PR: " + json.load(open(os.environ["RUNNER_TEMP"] + "/pull-request-response.json", encoding="utf-8"))["html_url"])' >> "$GITHUB_STEP_SUMMARY"

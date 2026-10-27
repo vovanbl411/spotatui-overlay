@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# CI не публикует результаты и не использует secrets; ему достаточно чтения.
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python automation
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Получить исходники без сохранения credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Проверить Python-логику
+        # Корневой tests/ pkgcheck считает именем категории Gentoo.
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: Проверить CRATES и Manifest
+        run: python3 scripts/release_automation.py check-manifest --root "$GITHUB_WORKSPACE"
+
+  pkgcheck:
+    name: Gentoo package metadata checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GENTOO_PORTAGE_IMAGE: gentoo/portage@sha256:ce69e5b771bfe9404731e846b835346c34f2c82817ac3626f13af198689a1961
+      GENTOO_STAGE3_IMAGE: gentoo/stage3@sha256:d8536e52677e3efe4caf048ca588bc685bc2d24d7fdfc882de1cdc6d38c81d96
+    steps:
+      - name: Получить исходники без сохранения credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Запустить pkgcheck в Gentoo окружении
+        run: |
+          set -eu
+          docker create --name gentoo-portage "$GENTOO_PORTAGE_IMAGE" /bin/true
+          cleanup() { docker rm -f gentoo-portage >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          docker run --rm --volumes-from gentoo-portage \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/overlay,readonly" \
+            --workdir /overlay "$GENTOO_STAGE3_IMAGE" /bin/bash -e -c '
+              emerge --oneshot dev-util/pkgcheck
+              # Репозиторий поддерживает amd64 glibc; musl явно исключён в ebuild.
+              pkgcheck scan --repo /overlay --profile default/linux/amd64/23.0 --exit
+            '
