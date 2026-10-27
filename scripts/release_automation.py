@@ -131,9 +131,13 @@ def crates_from_ebuild(content: str) -> set[str]:
 
 
 def check_manifest(root: Path) -> int:
-    """Check that crate DIST entries and the current ebuild CRATES match exactly."""
-    current = packaged_versions(root)[-1]
-    expected = {f"{crate.replace('@', '-')}.crate" for crate in crates_from_ebuild(current.path.read_text())}
+    """Check that crate DIST entries cover CRATES from every saved ebuild."""
+    versions = packaged_versions(root)
+    expected = {
+        f"{crate.replace('@', '-')}.crate"
+        for packaged in versions
+        for crate in crates_from_ebuild(packaged.path.read_text(encoding="utf-8"))
+    }
     manifest = root / PACKAGE_DIR / "Manifest"
     actual = {
         fields[1]
@@ -214,6 +218,7 @@ def check_source_contract(
         raise AutomationError(
             f"Release tag v{expected} does not match Cargo package.version {new_version!r}."
         )
+    check_upstream_license(old_package, new_package, current_source, candidate_source)
     for package, label in ((old_package, "packaged"), (new_package, "candidate")):
         rust_version = package.get("rust-version")
         if rust_version is not None and not isinstance(rust_version, str):
@@ -238,6 +243,49 @@ def check_source_contract(
             "Cargo.lock contains Git dependencies; determine a Gentoo packaging method: "
             + ", ".join(git_dependencies)
             + "."
+        )
+
+
+def check_upstream_license(
+    old_package: dict,
+    new_package: dict,
+    current_source: Path,
+    candidate_source: Path,
+) -> None:
+    """Stop when the application's declared license or license file changes."""
+    old_license = old_package.get("license")
+    new_license = new_package.get("license")
+    if old_license != new_license:
+        raise AutomationError("Upstream package.license changed; review the ebuild LICENSE manually.")
+
+    old_file = old_package.get("license-file")
+    new_file = new_package.get("license-file")
+    if old_file != new_file:
+        raise AutomationError("Upstream package.license-file changed; review the ebuild LICENSE manually.")
+    if old_file is None:
+        return
+    if not isinstance(old_file, str) or not old_file:
+        raise AutomationError("Upstream package.license-file is invalid; review the ebuild LICENSE manually.")
+
+    relative = Path(old_file)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise AutomationError(
+            "Upstream package.license-file is unsafe to compare; review the ebuild LICENSE manually."
+        )
+    try:
+        old_path = (current_source / relative).resolve()
+        new_path = (candidate_source / relative).resolve()
+        old_path.relative_to(current_source.resolve())
+        new_path.relative_to(candidate_source.resolve())
+        old_content = old_path.read_bytes()
+        new_content = new_path.read_bytes()
+    except (OSError, RuntimeError, ValueError) as error:
+        raise AutomationError(
+            "Unable to compare upstream package.license-file; review the ebuild LICENSE manually."
+        ) from error
+    if old_content != new_content:
+        raise AutomationError(
+            "Upstream package.license-file contents changed; review the ebuild LICENSE manually."
         )
 
 

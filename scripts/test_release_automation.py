@@ -18,16 +18,34 @@ class ReleaseAutomationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def ebuild(self, name: str, version: str) -> Path:
+    def ebuild(self, name: str, version: str, crates: set[str] | None = None) -> Path:
         path = self.package / name
+        crate_entries = sorted(crates or {"serde@1.0.0"})
+        crates_block = "\n".join(f"\t{crate}" for crate in crate_entries)
         path.write_text(
-            f'EAPI=8\nCRATES="\n\tserde@1.0.0\n"\nIUSE="mpris"\n'
+            f'EAPI=8\nCRATES="\n{crates_block}\n"\nIUSE="mpris"\n'
             f'RDEPEND="mpris? ( sys-apps/dbus )"\n'
             f'src_configure() {{\n local -a myfeatures=( tui streaming )\n'
             f' use mpris && myfeatures+=( mpris )\n}}\n# {version}\n',
             encoding="utf-8",
         )
         return path
+
+    def test_manifest_accepts_union_of_fallback_and_candidate_crates(self) -> None:
+        self.ebuild("spotatui-1.2.3.ebuild", "1.2.3", {"serde@1.0.0", "old-crate@2.0.0"})
+        self.ebuild("spotatui-1.2.4.ebuild", "1.2.4", {"serde@1.0.1", "new-crate@3.0.0"})
+        crate_archives = {
+            "serde-1.0.0.crate",
+            "old-crate-2.0.0.crate",
+            "serde-1.0.1.crate",
+            "new-crate-3.0.0.crate",
+        }
+        (self.package / "Manifest").write_text(
+            "".join(f"DIST {archive} 1 BLAKE2B 0 SHA512 0\n" for archive in sorted(crate_archives)),
+            encoding="utf-8",
+        )
+
+        self.assertEqual(automation.check_manifest(self.root), len(crate_archives))
 
     def release(self, version: str) -> dict[str, str]:
         return {
@@ -37,12 +55,20 @@ class ReleaseAutomationTests(unittest.TestCase):
         }
 
     def cargo_source(
-        self, path: Path, version: str, *, features: str | None = None, native: bool = False
+        self,
+        path: Path,
+        version: str,
+        *,
+        features: str | None = None,
+        native: bool = False,
+        package_fields: str = "",
+        license_file_content: str | None = None,
     ) -> Path:
         path.mkdir(parents=True)
         path.joinpath("Cargo.toml").write_text(
             f'[package]\nname="spotatui"\nversion="{version}"\nrust-version="1.91"\n'
-            f'[features]\ntui=[]\nstreaming=[]\ncover-art=[]\ninternet-radio=[]\n'
+            + package_fields
+            + f'[features]\ntui=[]\nstreaming=[]\ncover-art=[]\ninternet-radio=[]\n'
             f'local-files=[]\nmpris=[]\nqobuz=[]\nsubsonic=[]\naudio-viz=[]\nyoutube=[]\n'
             + ('[dependencies]\nalsa-sys="0.3"\n' if native else "")
             + (features or ""),
@@ -55,6 +81,8 @@ class ReleaseAutomationTests(unittest.TestCase):
             'source = "registry+https://github.com/rust-lang/crates.io-index"\n',
             encoding="utf-8",
         )
+        if license_file_content is not None:
+            path.joinpath("LICENSE.txt").write_text(license_file_content, encoding="utf-8")
         return path
 
     def test_release_tag_parser_rejects_prerelease_and_non_semver(self) -> None:
@@ -142,6 +170,31 @@ class ReleaseAutomationTests(unittest.TestCase):
             old = self.cargo_source(base / "old", "1.2.3")
             new = self.cargo_source(base / "new", "1.2.4", features="new-source=[]\n")
             with self.assertRaisesRegex(automation.AutomationError, "Cargo features changed"):
+                automation.check_source_contract(
+                    old, new, automation.Version(1, 2, 3), automation.Version(1, 2, 4), {"tui", "streaming"}
+                )
+
+    def test_changed_application_license_stops_preparation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            old = self.cargo_source(base / "old", "1.2.3", package_fields='license="MIT"\n')
+            new = self.cargo_source(base / "new", "1.2.4", package_fields='license="GPL-3.0-only"\n')
+            with self.assertRaisesRegex(automation.AutomationError, "package.license changed"):
+                automation.check_source_contract(
+                    old, new, automation.Version(1, 2, 3), automation.Version(1, 2, 4), {"tui", "streaming"}
+                )
+
+    def test_changed_application_license_file_stops_preparation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            fields = 'license-file="LICENSE.txt"\n'
+            old = self.cargo_source(
+                base / "old", "1.2.3", package_fields=fields, license_file_content="MIT License\n"
+            )
+            new = self.cargo_source(
+                base / "new", "1.2.4", package_fields=fields, license_file_content="GPL License\n"
+            )
+            with self.assertRaisesRegex(automation.AutomationError, "license-file contents changed"):
                 automation.check_source_contract(
                     old, new, automation.Version(1, 2, 3), automation.Version(1, 2, 4), {"tui", "streaming"}
                 )
