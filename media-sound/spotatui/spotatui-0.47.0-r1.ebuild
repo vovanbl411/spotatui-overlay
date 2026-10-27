@@ -822,23 +822,37 @@ inherit cargo
 
 DESCRIPTION="Terminal Spotify client with built-in playback"
 HOMEPAGE="https://github.com/LargeModGames/spotatui"
-SRC_URI="https://github.com/LargeModGames/spotatui/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz
+SRC_URI="https://github.com/LargeModGames/spotatui/archive/refs/tags/v${PV}.tar.gz -> ${PN}-${PV}.tar.gz
 	${CARGO_CRATE_URIS}"
 S="${WORKDIR}/spotatui-${PV}"
 
 LICENSE="0BSD Apache-2.0 Apache-2.0-with-LLVM-exceptions BSD BSD-1 BSD-2 Boost-1.0 CDLA-Permissive-2.0 ISC LGPL-3+ MIT MPL-2.0 UoI-NCSA Unicode-3.0 Unlicense ZLIB"
 SLOT="0"
 KEYWORDS="~amd64"
+IUSE="cover internet-radio local-files mpris qobuz subsonic visualizer youtube"
 REQUIRED_USE="!elibc_musl"
 
 DEPEND="
 	dev-libs/openssl:=
 	media-libs/alsa-lib
+	visualizer? ( media-video/pipewire:= )
 "
-RDEPEND="${DEPEND}"
+RDEPEND="
+	${DEPEND}
+	mpris? ( sys-apps/dbus )
+	youtube? ( net-misc/yt-dlp )
+"
 BDEPEND="virtual/pkgconfig"
 
 src_configure() {
 	local -a myfeatures=( tui streaming )
+	use cover && myfeatures+=( cover-art )
+	use internet-radio && myfeatures+=( internet-radio )
+	use local-files && myfeatures+=( local-files )
+	use mpris && myfeatures+=( mpris )
+	use qobuz && myfeatures+=( qobuz )
+	use subsonic && myfeatures+=( subsonic )
+	use visualizer && myfeatures+=( audio-viz )
+	use youtube && myfeatures+=( youtube )
 	cargo_src_configure --no-default-features
 }

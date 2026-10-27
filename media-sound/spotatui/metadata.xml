@@ -8,4 +8,14 @@
 	<upstream>
 		<remote-id type="github">LargeModGames/spotatui</remote-id>
 	</upstream>
+	<use>
+		<flag name="cover">Enable cover art in the terminal interface.</flag>
+		<flag name="internet-radio">Enable internet radio streams.</flag>
+		<flag name="local-files">Enable playback of local audio files.</flag>
+		<flag name="mpris">Enable MPRIS media controls over D-Bus.</flag>
+		<flag name="qobuz">Enable Qobuz as a music source.</flag>
+		<flag name="subsonic">Enable Subsonic-compatible servers as a music source.</flag>
+		<flag name="visualizer">Enable the PipeWire audio visualizer.</flag>
+		<flag name="youtube">Enable YouTube search and playback through yt-dlp.</flag>
+	</use>
 </pkgmetadata>
