@@ -1,6 +1,6 @@
 # spotatui Gentoo overlay
 
-Overlay устанавливает терминальный Spotify-клиент `spotatui` версии 0.48.0.
+Overlay устанавливает терминальный Spotify-клиент `spotatui` версии 0.47.0.
 Сборка включает TUI и воспроизведение Spotify через librespot. Дополнительные
 возможности включаются независимо USE-флагами и по умолчанию выключены. Cargo
 self-update, telemetry, Discord RPC, scripting, AI DJ/MCP, GUI и Soloist не
