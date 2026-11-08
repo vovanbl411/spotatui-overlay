@@ -164,14 +164,49 @@ class ReleaseAutomationTests(unittest.TestCase):
         with self.assertRaisesRegex(automation.AutomationError, "not covered by the current LICENSE"):
             automation.check_crate_licenses(current, generated)
 
-    def test_changed_upstream_features_stop_preparation(self) -> None:
+    def test_unrelated_upstream_feature_change_is_allowed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             old = self.cargo_source(base / "old", "1.2.3")
-            new = self.cargo_source(base / "new", "1.2.4", features="new-source=[]\n")
-            with self.assertRaisesRegex(automation.AutomationError, "Cargo features changed"):
+            new = self.cargo_source(
+                base / "new", "1.2.4", features="new-source=[]\n"
+            )
+    
+            automation.check_source_contract(
+                old, new,
+                automation.Version(1, 2, 3),
+                automation.Version(1, 2, 4),
+                {"tui", "streaming"},
+            )
+
+    def test_transitive_feature_change_stops_preparation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+    
+            old = self.cargo_source(
+                base / "old", "1.2.3", features="helper=[]\n"
+            )
+            new = self.cargo_source(
+                base / "new", "1.2.4",
+                features='helper=["streaming"]\n'
+            )
+    
+            for source in (old, new):
+                cargo = source / "Cargo.toml"
+                cargo.write_text(
+                    cargo.read_text().replace(
+                        "tui=[]", 'tui=["helper"]'
+                    )
+                )
+
+            with self.assertRaisesRegex(
+                automation.AutomationError, "Cargo features changed"
+            ):
                 automation.check_source_contract(
-                    old, new, automation.Version(1, 2, 3), automation.Version(1, 2, 4), {"tui", "streaming"}
+                    old, new,
+                    automation.Version(1, 2, 3),
+                    automation.Version(1, 2, 4),
+                    {"tui", "streaming"},
                 )
 
     def test_changed_application_license_stops_preparation(self) -> None:
