@@ -1,6 +1,6 @@
 # spotatui Gentoo overlay
 
-Overlay устанавливает терминальный Spotify-клиент `spotatui` версии 0.47.0.
+Overlay устанавливает терминальный Spotify-клиент `spotatui` версии 0.48.0.
 Сборка включает TUI и воспроизведение Spotify через librespot. Дополнительные
 возможности включаются независимо USE-флагами и по умолчанию выключены. Cargo
 self-update, telemetry, Discord RPC, scripting, AI DJ/MCP, GUI и Soloist не
@@ -85,9 +85,3 @@ emerge --ask media-sound/spotatui
 воспроизведение Spotify на Gentoo. Это подтверждение относится к сборке без
 новых USE-флагов и не распространяется на дополнительные возможности.
 
-Для `0.47.0-r1` прошли `bash -n`, проверка XML и `pkgcheck` на профиле
-amd64 glibc. Release-сборки Cargo с новыми флагами выключенными и со всеми
-включёнными прошли с `--offline`; все 815 crate-записей из `CRATES` найдены
-в Manifest. Прямой compile-фазе Portage помешал `sccache` с ошибкой
-`Operation not permitted`; Cargo-сборки запускались из подготовленного
-Portage vendor-каталога без сети. Новые возможности в runtime не проверялись.
