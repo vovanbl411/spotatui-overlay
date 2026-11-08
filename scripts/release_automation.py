@@ -170,6 +170,30 @@ def feature_map(manifest: dict) -> dict[str, object]:
     features = manifest.get("features", {})
     return features if isinstance(features, dict) else {}
 
+def reachable_cargo_features(manifest: dict, roots: set[str]) -> set[str]:
+    features = feature_map(manifest)
+    reachable = set()
+    pending = list(roots)
+
+    while pending:
+        name = pending.pop()
+
+        if name in reachable or name not in features:
+            continue
+
+        dependencies = features[name]
+        if not isinstance(dependencies, list) or not all(
+            isinstance(item, str) for item in dependencies
+        ):
+            raise AutomationError(f"Invalid Cargo feature definition: {name}.")
+
+        reachable.add(name)
+
+        for dependency in dependencies:
+            if dependency in features and dependency not in reachable:
+                pending.append(dependency)
+
+    return reachable
 
 def native_dependency_map(manifest: dict) -> dict[str, str]:
     result: dict[str, str] = {}
@@ -209,6 +233,8 @@ def check_source_contract(
     old_package, old_manifest, _ = read_cargo(current_source)
     new_package, new_manifest, lock_packages = read_cargo(candidate_source)
     new_version = new_package.get("version")
+    old_features = feature_map(old_manifest)
+    new_features = feature_map(new_manifest)
     if old_package.get("version") != str(current_version):
         raise AutomationError(
             f"Current ebuild version {current_version} does not match packaged upstream Cargo.toml "
@@ -225,14 +251,29 @@ def check_source_contract(
             raise AutomationError(f"The {label} Rust minimum version is invalid.")
     if old_package.get("rust-version") != new_package.get("rust-version"):
         raise AutomationError("Upstream rust-version changed; review the ebuild Rust requirement.")
-    if feature_map(old_manifest) != feature_map(new_manifest):
-        raise AutomationError("Upstream Cargo features changed; review the USE mapping manually.")
+    missing = sorted(mapped_features - new_features.keys())
+    if missing:
+        raise AutomationError(
+            f"Ebuild enables Cargo features missing upstream: {', '.join(missing)}."
+        )
+    
+    reachable = (
+        reachable_cargo_features(old_manifest, mapped_features)
+        | reachable_cargo_features(new_manifest, mapped_features)
+    )
+    
+    changed = sorted(
+        name for name in reachable
+        if old_features.get(name) != new_features.get(name)
+    )
+    
+    if changed:
+        raise AutomationError(
+            "Upstream Cargo features changed; review the USE mapping manually: "
+            + ", ".join(changed) + "."
+        )
     if native_dependency_map(old_manifest) != native_dependency_map(new_manifest):
         raise AutomationError("Native/system Cargo dependencies changed; review Gentoo dependencies manually.")
-    available = feature_map(new_manifest)
-    missing = sorted(mapped_features - available.keys())
-    if missing:
-        raise AutomationError(f"Ebuild enables Cargo features missing upstream: {', '.join(missing)}.")
     git_dependencies = sorted(
         f"{item.get('name')}@{item.get('version')}"
         for item in lock_packages
