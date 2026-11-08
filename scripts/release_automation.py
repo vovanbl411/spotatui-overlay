@@ -421,7 +421,7 @@ def _generated_crates(source_dir: Path, temp_dir: Path, base_ebuild: str) -> set
                 "pycargoebuild",
                 "--no-config",
                 "--no-manifest",
-                "--fill-crates",
+                # "--fill-crates",
                 "--distdir",
                 str(distdir),
                 "--license-mapping",
