@@ -24,7 +24,9 @@ jobs:
     name: Discover, prepare and validate candidate
     if: >-
       github.repository == 'vovanbl411/spotatui-overlay' &&
-      github.ref == 'refs/heads/main' && github.workflow_sha == github.sha
+      github.ref == 'refs/heads/main' && github.workflow_sha == github.sha &&
+      github.workflow_ref == 'vovanbl411/spotatui-overlay/.github/workflows/prepare-release.yml@refs/heads/main' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     permissions:
@@ -125,7 +127,9 @@ jobs:
     if: >-
       needs.prepare.result == 'success' && needs.prepare.outputs.publish_ready == 'true' &&
       !inputs.dry_run && github.repository == 'vovanbl411/spotatui-overlay' &&
-      github.ref == 'refs/heads/main' && github.workflow_sha == github.sha
+      github.ref == 'refs/heads/main' && github.workflow_sha == github.sha &&
+      github.workflow_ref == 'vovanbl411/spotatui-overlay/.github/workflows/prepare-release.yml@refs/heads/main' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -146,79 +150,15 @@ jobs:
           skip-decompress: true
           digest-mismatch: error
 
-      - name: Проверить remote base и применить проверенный handoff
-        id: apply
+      - name: Проверить handoff и опубликовать Draft PR
         env:
-          EXPECTED_BASE: ${{ github.workflow_sha }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          PUBLISH_READY: ${{ needs.prepare.outputs.publish_ready }}
           ARTIFACT_ID: ${{ needs.prepare.outputs.artifact_id }}
           ARTIFACT_DIGEST: ${{ needs.prepare.outputs.artifact_digest }}
-        run: |
-          set -eu
-          remote="$(git ls-remote --exit-code "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/main)"
-          test "${remote%%$'\t'*}" = "$EXPECTED_BASE" || {
-            echo "main moved after preparation; refusing to publish stale candidate" >&2
-            exit 1
-          }
-          shopt -s nullglob dotglob
-          archives=("$RUNNER_TEMP/release-download/"*)
-          test "${#archives[@]}" = 1 || {
-            echo "Expected one downloaded handoff archive" >&2
-            exit 1
-          }
-          python3 scripts/release_automation.py apply \
-            --root "$GITHUB_WORKSPACE" --handoff "${archives[0]}" \
-            --expected-base "$EXPECTED_BASE" \
-            --artifact-id "$ARTIFACT_ID" --artifact-digest "$ARTIFACT_DIGEST" \
-            --pull-request-request "$RUNNER_TEMP/pull-request.json" \
-            --github-output "$GITHUB_OUTPUT"
-
-      - name: Создать automation branch и commit
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BRANCH: ${{ steps.apply.outputs.branch }}
-          RELEASE_TAG: ${{ steps.apply.outputs.tag }}
-        run: |
-          set -euo pipefail
-          if git ls-remote --exit-code --heads "https://github.com/${GITHUB_REPOSITORY}.git" "$BRANCH" >/dev/null 2>&1; then
-            echo "Automation branch already exists; refusing to overwrite it" >&2
-            exit 1
-          fi
-          pr_count="$(gh pr list --state all --head "$GITHUB_REPOSITORY_OWNER:$BRANCH" --json number --jq 'length')"
-          if [ "$pr_count" -gt 0 ]; then
-            echo "A pull request already exists for this release" >&2
-            exit 1
-          fi
-          git switch --create "$BRANCH"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add README.md media-sound/spotatui
-          git diff --cached --check
-          git diff --cached --quiet && exit 1
-          git commit -m "update: spotatui ${RELEASE_TAG}"
-          askpass="$RUNNER_TEMP/git-askpass.sh"
-          cat > "$askpass" <<'SH'
-          #!/bin/sh
-          case "$1" in
-            *Username*) printf '%s\n' 'x-access-token' ;;
-            *Password*) printf '%s\n' "$GH_TOKEN" ;;
-            *) exit 1 ;;
-          esac
-          SH
-          chmod 700 "$askpass"
-          GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
-            git push "https://github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${BRANCH}"
-
-      - name: Открыть Draft PR
-        env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          curl --fail-with-body --silent --show-error \
-            --request POST \
-            --header "Accept: application/vnd.github+json" \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "Content-Type: application/json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            --data-binary "@$RUNNER_TEMP/pull-request.json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls" \
-            > "$RUNNER_TEMP/pull-request-response.json"
-          python3 -c 'import json, os; print("Draft PR: " + json.load(open(os.environ["RUNNER_TEMP"] + "/pull-request-response.json", encoding="utf-8"))["html_url"])' >> "$GITHUB_STEP_SUMMARY"
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/publish_release.py \
+            --root "$GITHUB_WORKSPACE" --download "$RUNNER_TEMP/release-download" \
+            --summary "$GITHUB_STEP_SUMMARY"

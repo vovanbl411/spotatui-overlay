@@ -420,7 +420,6 @@ class ReleaseAutomationTests(unittest.TestCase):
 
     def make_handoff(self) -> tuple[Path, Path, dict, dict]:
         old = self.ebuild("spotatui-1.2.3.ebuild", "1.2.3")
-        (self.root / "README.md").write_text("клиент `spotatui` версии 1.2.3.\n", encoding="utf-8")
         release = self.release("1.2.4")
         base = self.distfile_evidence(b"packaged source")
         shared = self.distfile_evidence(b"verified shared crate")
@@ -446,7 +445,6 @@ class ReleaseAutomationTests(unittest.TestCase):
         candidate = self.root / "candidate"
         package = candidate / automation.PACKAGE_DIR
         package.mkdir(parents=True)
-        (candidate / "README.md").write_text("клиент `spotatui` версии 1.2.4.\n", encoding="utf-8")
         (package / "Manifest").write_text(
             self.manifest({**previous, "spotatui-1.2.4.tar.gz": source}), encoding="utf-8",
         )
@@ -460,19 +458,27 @@ class ReleaseAutomationTests(unittest.TestCase):
     def test_publisher_rejects_unallowlisted_handoff_file(self) -> None:
         candidate, bundle, context, report = self.make_handoff()
         automation.write_handoff(candidate, bundle, report, context, "success")
-        with zipfile.ZipFile(bundle, "a") as archive:
-            archive.writestr(".github/workflows.yml", "untrusted\n")
-        with self.assertRaisesRegex(automation.AutomationError, "allowlist mismatch"):
-            automation.validate_handoff(self.root, bundle, context, "77", automation.file_sha256(bundle))
+        for name in ("README.md", ".github/workflows.yml"):
+            with self.subTest(name=name):
+                extra = bundle.with_name(Path(name).name + ".zip")
+                extra.write_bytes(bundle.read_bytes())
+                with zipfile.ZipFile(extra, "a") as archive:
+                    archive.writestr(name, "untrusted\n")
+                with self.assertRaisesRegex(automation.AutomationError, "allowlist mismatch"):
+                    automation.validate_handoff(self.root, extra, context, "77", automation.file_sha256(extra))
 
     def test_publisher_applies_only_validated_candidate_files(self) -> None:
         candidate, bundle, context, report = self.make_handoff()
         automation.write_handoff(candidate, bundle, report, context, "success")
-        result = automation.apply_handoff(self.root, bundle, context, "77", automation.file_sha256(bundle))
-        self.assertTrue((self.package / "spotatui-1.2.4.ebuild").is_file())
-        self.assertEqual((self.root / "README.md").read_text(), "клиент `spotatui` версии 1.2.4.\n")
-        self.assertEqual(result["branch"], "automation/spotatui-v1.2.4")
-        self.assertIn("Manual gates", result["body"])
+        result, files = automation.apply_handoff(self.root, bundle, context, "77", automation.file_sha256(bundle))
+        expected = {str(automation.PACKAGE_DIR / name) for name in (report["candidate"], "Manifest")}
+        with zipfile.ZipFile(bundle) as archive:
+            self.assertEqual(set(archive.namelist()), expected | {automation.HANDOFF_METADATA})
+        self.assertEqual(set(files), expected)
+        self.assertEqual(result["candidate"], "spotatui-1.2.4.ebuild")
+        for name, contents in files.items():
+            self.assertEqual((self.root / name).read_bytes(), contents)
+        self.assertTrue((self.package / result["fallback"]).is_file())
 
     def test_publisher_rejects_wrong_artifact_digest_id_or_context(self) -> None:
         candidate, bundle, context, report = self.make_handoff()
@@ -499,7 +505,7 @@ class ReleaseAutomationTests(unittest.TestCase):
                 with self.assertRaisesRegex(automation.AutomationError, "mandatory checks"):
                     automation.write_handoff(candidate, bundle, {**report, "validation": validation}, context, status)
                 self.assertFalse(bundle.exists())
-        (candidate / "README.md").write_text("changed after pkgcheck")
+        (candidate / automation.PACKAGE_DIR / "Manifest").write_text("changed after pkgcheck")
         with self.assertRaisesRegex(automation.AutomationError, "changed after validation"):
             automation.write_handoff(candidate, bundle, report, context, "success")
         self.assertFalse(bundle.exists())
@@ -520,22 +526,24 @@ class ReleaseAutomationTests(unittest.TestCase):
         automation.write_handoff(candidate, bundle, report, context, "success")
         with zipfile.ZipFile(bundle) as original:
             contents = [(member, original.read(member)) for member in original.infolist()]
+        manifest = str(automation.PACKAGE_DIR / "Manifest")
         for name, data, mode, error in (
-            ("README.md", b"changed", stat.S_IFREG, "validated digests"),
-            ("README.md", b"Manifest", stat.S_IFLNK, "Unexpected file type"),
-            ("../README.md", b"changed", stat.S_IFREG, "allowlist mismatch"),
-            (automation.HANDOFF_METADATA, None, stat.S_IFREG, "mandatory checks"),
+            (manifest, b"changed", stat.S_IFREG | 0o644, "validated digests"),
+            (manifest, b"Manifest", stat.S_IFLNK | 0o644, "Unexpected file type"),
+            (manifest, b"Manifest", stat.S_IFREG | 0o755, "Unexpected file type"),
+            ("../Manifest", b"changed", stat.S_IFREG | 0o644, "allowlist mismatch"),
+            (automation.HANDOFF_METADATA, None, stat.S_IFREG | 0o644, "mandatory checks"),
         ):
             with self.subTest(name=name, error=error):
                 mutated = self.root / f"mutated-{error.replace(' ', '-')}.zip"
-                original_name = automation.HANDOFF_METADATA if data is None else "README.md"
+                original_name = automation.HANDOFF_METADATA if data is None else manifest
                 with zipfile.ZipFile(mutated, "w") as archive:
                     for member, original_data in contents:
                         if member.filename != original_name:
                             archive.writestr(member, original_data)
                     replaced = zipfile.ZipInfo(name)
                     replaced.create_system = 3
-                    replaced.external_attr = (mode | 0o644) << 16
+                    replaced.external_attr = mode << 16
                     if data is None:
                         data = json.dumps({**report, **context, "validation": {}}).encode()
                     archive.writestr(replaced, data)

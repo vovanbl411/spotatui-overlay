@@ -59,7 +59,7 @@ NATIVE_CRATES = frozenset(
         "sdl2-sys",
     }
 )
-ALLOWED_HANDOFF = {"README.md", str(PACKAGE_DIR / "Manifest")}
+ALLOWED_HANDOFF = {str(PACKAGE_DIR / "Manifest")}
 HANDOFF_METADATA = "release-handoff.json"
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -651,17 +651,6 @@ def candidate_plan(root: Path, release: dict[str, str]) -> dict[str, object]:
     }
 
 
-def update_readme(readme: str, current: Version, candidate: str) -> str:
-    updated, count = re.subn(
-        rf"(клиент `spotatui` версии ){re.escape(str(current))}(?=\.)",
-        rf"\g<1>{candidate}",
-        readme,
-    )
-    if count != 1:
-        raise AutomationError("README package version line was not found exactly once.")
-    return updated
-
-
 def crate_distfiles(crates: set[str]) -> set[str]:
     names = {f"{crate.replace('@', '-')}.crate" for crate in crates}
     if len(crates) != len(names):
@@ -766,10 +755,6 @@ def prepare_candidate(
 
     candidate_path = output / PACKAGE_DIR / str(plan["candidate"])
     candidate_path.write_text(replace_crates(current_ebuild, generated), encoding="utf-8")
-    (output / "README.md").write_text(
-        update_readme((root / "README.md").read_text(encoding="utf-8"), current.version, str(version)),
-        encoding="utf-8",
-    )
     with preparation_check(summary, "Manifest generation"):
         run_checked(
             "Portage ebuild manifest", ["ebuild", str(candidate_path), "manifest"],
@@ -863,11 +848,11 @@ def validate_handoff(root: Path, bundle: Path, context: dict, artifact_id: str, 
     try:
         with zipfile.ZipFile(io.BytesIO(payload)) as archive:
             members = archive.infolist()
-            if len(members) != 4 or len({member.filename for member in members}) != 4:
+            if len(members) != 3 or len({member.filename for member in members}) != 3:
                 raise AutomationError("Release handoff file allowlist mismatch.")
             for member in members:
                 if (member.orig_filename != member.filename or member.create_system != 3
-                        or not stat.S_ISREG(member.external_attr >> 16)
+                        or (member.external_attr >> 16) != (stat.S_IFREG | 0o644)
                         or member.file_size > 4 * 1024 * 1024 or member.flag_bits & 1):
                     raise AutomationError(f"Unexpected file type or size in handoff: {member.filename!r}.")
             report = json.loads(archive.read(HANDOFF_METADATA))
@@ -910,9 +895,6 @@ def validate_handoff(root: Path, bundle: Path, context: dict, artifact_id: str, 
     current_crates = crates_from_ebuild(current_ebuild)
     if report.get("crate_added") != sorted(crates - current_crates) or report.get("crate_removed") != sorted(current_crates - crates):
         raise AutomationError("Handoff crate changes do not match the ebuild diff.")
-    readme = (root / "README.md").read_text(encoding="utf-8")
-    if files["README.md"] != update_readme(readme, current.version, str(version)).encode():
-        raise AutomationError("Handoff README changes go beyond the expected version update.")
     manifest_path = PACKAGE_DIR / "Manifest"
     archive_name = source_distfile(version)
     check_candidate_manifest(
@@ -923,79 +905,19 @@ def validate_handoff(root: Path, bundle: Path, context: dict, artifact_id: str, 
     return report, files
 
 
-def apply_handoff(root: Path, bundle: Path, context: dict, artifact_id: str, artifact_digest: str) -> dict:
+def apply_handoff(root: Path, bundle: Path, context: dict, artifact_id: str, artifact_digest: str) -> tuple[dict, dict[str, bytes]]:
     report, files = validate_handoff(root, bundle, context, artifact_id, artifact_digest)
-    for relative, data in files.items():
-        (root / relative).write_bytes(data)
+    candidate = root / PACKAGE_DIR / report["candidate"]
+    manifest = root / PACKAGE_DIR / "Manifest"
+    if not stat.S_ISREG(manifest.lstat().st_mode):
+        raise AutomationError("Handoff target Manifest is not a regular file.")
+    # Exclusive creation also rejects ignored files and dangling symlinks.
+    with candidate.open("xb") as stream:
+        stream.write(files[str(candidate.relative_to(root))])
+    manifest.write_bytes(files[str(manifest.relative_to(root))])
     if report["removed"]:
         (root / PACKAGE_DIR / report["removed"]).unlink()
-    report["branch"] = f"automation/spotatui-v{report['version']}"
-    report["title"] = f"[release-bump] spotatui v{report['version']}"
-    report["artifact_id"] = artifact_id
-    report["artifact_digest"] = artifact_digest.removeprefix("sha256:")
-    report["body"] = pull_request_body(report)
-    return report
-
-
-def check_publish_diff(root: Path, report: dict) -> None:
-    status = subprocess.check_output(
-        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=root
-    ).decode().split("\0")
-    expected = {
-        " M README.md", f" M {PACKAGE_DIR / 'Manifest'}", f"?? {PACKAGE_DIR / report['candidate']}",
-    }
-    if report["removed"]:
-        expected.add(f" D {PACKAGE_DIR / report['removed']}")
-    if set(filter(None, status)) != expected:
-        raise AutomationError("Applied handoff has an unexpected working-tree diff.")
-    run_checked("Validate applied Git diff", ["git", "diff", "--check"], cwd=root)
-
-
-def pull_request_body(report: dict[str, object]) -> str:
-    added = report.get("crate_added", [])
-    removed = report.get("crate_removed", [])
-    lines = [
-        f"# spotatui release [{report['tag']}]({report['release_url']})",
-        "",
-        "## Package rotation",
-        "",
-        f"- Candidate: `{report['candidate']}`",
-        f"- Fallback retained: `{report['fallback']}`",
-    ]
-    if report.get("removed"):
-        lines.append(f"- Older fallback removed: `{report['removed']}`")
-    lines.extend(["", "## Cargo dependency changes", ""])
-    lines.append(f"- Added registry crates: {len(added)}")
-    lines.append(f"- Removed registry crates: {len(removed)}")
-    if added:
-        lines.extend(["", "Added:", "", *[f"- `{item}`" for item in added]])
-    if removed:
-        lines.extend(["", "Removed:", "", *[f"- `{item}`" for item in removed]])
-    lines.extend(
-        [
-            "",
-            "## Automated checks",
-            "",
-            f"- Base: `{report['base_commit']}`, upstream commit: `{report['upstream_commit']}`",
-            f"- Verified source SHA512: `{report['archive']['SHA512']}`",
-            f"- Cargo.lock SHA-256: `{report['cargo_lock_sha256']}`",
-            f"- Workflow run {report['run_id']}, attempt {report['run_attempt']}, artifact {report['artifact_id']}",
-            f"- Artifact SHA-256: `{report['artifact_digest']}`",
-            *[f"- {check}: {result}" for check, result in report["validation"].items()],
-            "- No client build or runtime test is claimed by these metadata checks.",
-            "",
-            "## Manual gates before accepting",
-            "",
-            "- [ ] Review upstream release notes and the full ebuild/Manifest diff.",
-            "- [ ] Check whether Cargo changes require new Gentoo system dependencies or packaging decisions.",
-            "- [ ] Run `emerge -pv media-sound/spotatui` and build the candidate with the intended USE flags.",
-            "- [ ] Test Spotify and enabled optional features at runtime.",
-            "- [ ] Manually accept the Draft PR when review is complete.",
-            "",
-            "GitHub may require approval to run pull request CI for a PR opened with `GITHUB_TOKEN`.",
-        ]
-    )
-    return "\n".join(lines)
+    return report, files
 
 
 def api_json(url: str, token: str | None = None) -> object:
@@ -1034,11 +956,7 @@ def discover(root: Path, repository: str, token: str | None) -> dict[str, object
     if type(release_id) is not int or release_id < 1:
         raise AutomationError("Upstream releases/latest did not return a valid release ID.")
     release.update(release_id=str(release_id), commit=resolve_tag(release["tag"]))
-    return {**plan, "release": release, "branch": branch}
-
-
-def write_output(path: Path, key_values: dict[str, object]) -> None:
-    path.write_text("".join(f"{key}={str(value).lower()}\n" for key, value in key_values.items()), encoding="utf-8")
+    return {**plan, "release": release}
 
 
 def main() -> int:
@@ -1059,7 +977,6 @@ def main() -> int:
     prep.add_argument("--result", type=Path, required=True)
     prep.add_argument("--output", type=Path, required=True)
     prep.add_argument("--base-commit", required=True)
-    prep.add_argument("--dry-run", action="store_true")
     prep.add_argument("--handoff", type=Path)
     prep.add_argument("--summary", type=Path)
     prep.add_argument("--unit-tests", default="")
@@ -1067,14 +984,6 @@ def main() -> int:
     upload.add_argument("--handoff", type=Path, required=True)
     upload.add_argument("--artifact-id", required=True)
     upload.add_argument("--artifact-digest", required=True)
-    apply = subparsers.add_parser("apply")
-    apply.add_argument("--root", type=Path, default=Path.cwd())
-    apply.add_argument("--handoff", type=Path, required=True)
-    apply.add_argument("--expected-base", required=True)
-    apply.add_argument("--artifact-id", required=True)
-    apply.add_argument("--artifact-digest", required=True)
-    apply.add_argument("--pull-request-request", type=Path, required=True)
-    apply.add_argument("--github-output", type=Path)
     args = parser.parse_args()
     try:
         if args.command == "check-manifest":
@@ -1085,7 +994,7 @@ def main() -> int:
             result["dry_run"] = args.dry_run
             args.result.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
             if args.github_output:
-                write_output(args.github_output, {"outcome": result["outcome"], "release_tag": result.get("release", {}).get("tag", "") if isinstance(result.get("release"), dict) else "", "available": result["outcome"] == "release-available"})
+                args.github_output.write_text(f"outcome={result['outcome']}\n", encoding="utf-8")
             if args.summary:
                 args.summary.write_text(
                     "## spotatui release discovery\n\n"
@@ -1103,7 +1012,7 @@ def main() -> int:
             release = result.get("release")
             if not isinstance(release, dict) or result.get("outcome") != "release-available":
                 raise AutomationError("No new stable release is available for preparation.")
-            dry_run = args.dry_run or result.get("dry_run") is True
+            dry_run = result.get("dry_run") is True
             if FULL_SHA.fullmatch(args.base_commit) is None:
                 raise AutomationError("Prepare requires a full base commit SHA.")
             report = prepare_candidate(args.root, release, args.output, dry_run=dry_run, summary=args.summary)
@@ -1115,30 +1024,6 @@ def main() -> int:
             return 0
         if args.command == "check-upload":
             check_upload(args.handoff, args.artifact_id, args.artifact_digest)
-            return 0
-        if args.command == "apply":
-            context = handoff_context(args.expected_base, os.getenv("GITHUB_RUN_ID", ""), os.getenv("GITHUB_RUN_ATTEMPT", ""))
-            actual_base = run_checked("Read publish checkout SHA", ["git", "rev-parse", "HEAD"],
-                                      cwd=args.root, capture_output=True).stdout.strip()
-            if actual_base != args.expected_base:
-                raise AutomationError("Publish checkout does not match the trusted Prepare revision.")
-            status = run_checked("Check publish working tree", ["git", "status", "--porcelain", "--untracked-files=all"],
-                                 cwd=args.root, capture_output=True).stdout
-            if status:
-                raise AutomationError("Publish checkout is not clean.")
-            report = apply_handoff(args.root, args.handoff, context, args.artifact_id, args.artifact_digest)
-            check_publish_diff(args.root, report)
-            request = {
-                "base": "main",
-                "body": report["body"],
-                "draft": True,
-                "head": report["branch"],
-                "title": report["title"],
-            }
-            args.pull_request_request.write_text(json.dumps(request) + "\n", encoding="utf-8")
-            if args.github_output:
-                write_output(args.github_output, {"branch": report["branch"], "tag": report["tag"], "candidate": report["version"]})
-            print(json.dumps({key: report[key] for key in ("branch", "title", "version")}, indent=2))
             return 0
     except (AutomationError, OSError, UnicodeError, json.JSONDecodeError) as error:
         if args.command == "discover" and args.summary:
