@@ -74,6 +74,7 @@ jobs:
       - name: Подготовить и проверить кандидат в Gentoo
         if: steps.discovery.outputs.outcome == 'release-available' && env.DRY_RUN != 'true'
         env:
+          GH_TOKEN: ${{ github.token }}
           UNIT_TESTS_RESULT: ${{ steps.unit_tests.outcome }}
         run: |
           set -eu
@@ -84,12 +85,12 @@ jobs:
             --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/overlay,readonly" \
             --mount "type=bind,src=$RUNNER_TEMP,dst=/runner-temp" \
             --workdir /overlay \
-            --env BASE_COMMIT --env HANDOFF_NAME --env UNIT_TESTS_RESULT \
+            --env BASE_COMMIT --env HANDOFF_NAME --env UNIT_TESTS_RESULT --env GH_TOKEN \
             --env GITHUB_RUN_ID --env GITHUB_RUN_ATTEMPT \
             --env "SUMMARY=/runner-temp/${GITHUB_STEP_SUMMARY#"$RUNNER_TEMP/"}" \
             "$GENTOO_STAGE3_IMAGE" /bin/bash -e -c '
               echo "Install Gentoo validation tools"
-              emerge --oneshot app-portage/pycargoebuild dev-util/pkgcheck
+              env -u GH_TOKEN emerge --oneshot app-portage/pycargoebuild dev-util/pkgcheck
               python3 /overlay/scripts/release_automation.py prepare \
                 --root /overlay --result /runner-temp/release.json \
                 --output /runner-temp/candidate --base-commit "$BASE_COMMIT" \

@@ -4,13 +4,16 @@ import gzip
 import hashlib
 import io
 import json
+import os
 import stat
 import tarfile
 import tempfile
 import unittest
 import zipfile
+from email.message import Message
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
+from urllib.response import addinfourl
 
 from scripts import release_automation as automation
 
@@ -315,6 +318,7 @@ class ReleaseAutomationTests(unittest.TestCase):
         self.ebuild("spotatui-1.2.3.ebuild", "1.2.3")
         commit = {"type": "commit", "sha": "a" * 40}
         annotation = {"type": "tag", "sha": "b" * 40}
+        upstream = f"{automation.API}/repos/{automation.UPSTREAM}"
         for reference, objects in ((commit, []), (annotation, [{"sha": "b" * 40, "object": commit}])):
             with self.subTest(kind=reference["type"]), patch.object(
                 automation, "api_json", side_effect=[release, [], {"ref": ref, "object": reference}, *objects],
@@ -322,7 +326,103 @@ class ReleaseAutomationTests(unittest.TestCase):
                 result = automation.discover(self.root, "owner/repo", "read-token")
                 self.assertEqual(result["release"]["commit"], commit["sha"])
                 self.assertEqual(result["release"]["release_id"], "42")
-                self.assertTrue(api.call_args_list[2].args[0].endswith("/git/ref/tags/v1.2.4"))
+                expected = [
+                    call(f"{upstream}/releases/latest", "read-token"),
+                    call(f"{automation.API}/repos/owner/repo/pulls?state=all"
+                         f"&head=owner%3Aautomation/spotatui-{tag}&per_page=100", "read-token"),
+                    call(f"{upstream}/git/ref/tags/{tag}", "read-token"),
+                ]
+                if objects:
+                    expected.append(call(f"{upstream}/git/tags/{annotation['sha']}", "read-token"))
+                self.assertEqual(api.call_args_list, expected)
+
+    def test_prepare_cli_authenticates_packaged_tag_without_exposing_token_to_download(self) -> None:
+        self.ebuild("spotatui-1.2.3.ebuild", "1.2.3")
+        evidence = self.distfile_evidence(b"accepted")
+        (self.package / "Manifest").write_text(self.manifest({
+            "spotatui-1.2.3.tar.gz": evidence, "serde-1.0.0.crate": evidence,
+        }), encoding="utf-8")
+        result = self.root / "release.json"
+        result.write_text(json.dumps({"outcome": "release-available", "release": {
+            **self.release("1.2.4"), "commit": "a" * 40, "release_id": "42",
+        }}), encoding="utf-8")
+
+        def stop_at_download(version, commit, archive, destination, *, accepted):
+            self.assertFalse("GH_TOKEN" in os.environ)
+            self.assertEqual(str(version), "1.2.3")
+            self.assertEqual(commit, "b" * 40)
+            self.assertEqual(accepted, evidence)
+            raise automation.AutomationError("Stop after baseline tag resolution.")
+
+        with (
+            patch.dict(os.environ, {"GH_TOKEN": "read-token"}),
+            patch("sys.argv", ["release_automation.py", "prepare", "--root", str(self.root),
+                               "--result", str(result), "--output", str(self.root / "candidate"),
+                               "--base-commit", "c" * 40]),
+            patch.object(automation, "api_json", return_value={
+                "ref": "refs/tags/v1.2.3", "object": {"type": "commit", "sha": "b" * 40},
+            }) as api,
+            patch.object(automation, "download_source", side_effect=stop_at_download) as download,
+            patch("builtins.print"),
+        ):
+            self.assertEqual(automation.main(), 1)
+        api.assert_called_once_with(f"{automation.API}/repos/{automation.UPSTREAM}/git/ref/tags/v1.2.3", "read-token")
+        download.assert_called_once()
+
+    def test_api_uses_bearer_header_only_when_token_is_provided(self) -> None:
+        url = f"{automation.API}/repos/{automation.UPSTREAM}/releases/latest"
+        for token, expected in (("read-token", "Bearer read-token"), (None, None)):
+            with self.subTest(authenticated=token is not None), patch("urllib.request.HTTPSHandler.https_open") as send:
+                send.return_value = addinfourl(io.BytesIO(b"{}"), Message(), url, 200)
+                send.return_value.msg = "OK"
+                self.assertEqual(automation.api_json(url, token), {})
+                send.assert_called_once()
+                self.assertEqual(send.call_args.args[0].get_header("Authorization"), expected)
+
+    def test_api_rejects_other_hosts_and_redirects_before_sending_token(self) -> None:
+        url = f"{automation.API}/repos/{automation.UPSTREAM}/releases/latest"
+        other = "https://api.github.com.example.com/"
+        with patch("urllib.request.HTTPSHandler.https_open") as send:
+            with self.assertRaises(automation.AutomationError):
+                automation.api_json(other, "read-token")
+            send.assert_not_called()
+            for target in (other, f"{automation.API}/different-endpoint"):
+                with self.subTest(target=target):
+                    send.reset_mock()
+                    headers = Message()
+                    headers["Location"] = target
+                    send.return_value = addinfourl(io.BytesIO(b"{}"), headers, url, 302)
+                    send.return_value.msg = "Found"
+                    with self.assertRaisesRegex(automation.AutomationError, "HTTP 302"):
+                        automation.api_json(url, "read-token")
+                    send.assert_called_once()
+
+    def test_api_rate_limit_diagnostics_report_only_valid_header_values(self) -> None:
+        url = f"{automation.API}/repos/{automation.UPSTREAM}/releases/latest"
+        token = "read-token"
+        for status, retry_after, expected in (
+            (403, "60", "Retry-After=60"),
+            (429, "Fri, 27 Nov 2026 05:23:00 GMT", "Retry-After=Fri, 27 Nov 2026 05:23:00 GMT"),
+            (429, token, None),
+        ):
+            with self.subTest(status=status, retry_after=retry_after), patch("urllib.request.HTTPSHandler.https_open") as send:
+                headers = Message()
+                headers["X-RateLimit-Remaining"] = "0"
+                headers["X-RateLimit-Reset"] = "1795756980"
+                headers["Retry-After"] = retry_after
+                send.return_value = addinfourl(io.BytesIO(token.encode()), headers, url, status)
+                send.return_value.msg = token
+                with self.assertRaisesRegex(automation.AutomationError, f"HTTP {status}") as failure:
+                    automation.api_json(url, token)
+                message = str(failure.exception)
+                self.assertIn("X-RateLimit-Remaining=0", message)
+                self.assertIn("X-RateLimit-Reset=1795756980", message)
+                if expected:
+                    self.assertIn(expected, message)
+                else:
+                    self.assertNotIn("Retry-After", message)
+                self.assertNotIn(token, message)
+                send.assert_called_once()
 
     def test_invalid_tag_objects_are_rejected(self) -> None:
         tag = "v1.2.4"

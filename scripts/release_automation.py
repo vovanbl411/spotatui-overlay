@@ -21,10 +21,11 @@ import zipfile
 import zlib
 from contextlib import contextmanager
 from dataclasses import dataclass
+from http.client import HTTPException
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.parse import quote, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 UPSTREAM = "LargeModGames/spotatui"
@@ -422,12 +423,12 @@ def source_url(tag: str) -> str:
     return f"https://github.com/{UPSTREAM}/archive/refs/tags/{tag}.tar.gz"
 
 
-def resolve_tag(tag: str) -> str:
+def resolve_tag(tag: str, token: str | None = None) -> str:
     if tag != f"v{Version.parse(tag)}":
         raise AutomationError(f"Noncanonical upstream tag: {tag}.")
     endpoint = f"{API}/repos/{UPSTREAM}/git"
     ref = f"refs/tags/{tag}"
-    payload = api_json(f"{endpoint}/ref/tags/{tag}")
+    payload = api_json(f"{endpoint}/ref/tags/{tag}", token)
     if not isinstance(payload, dict) or payload.get("ref") != ref:
         raise AutomationError(f"Upstream tag API did not return {ref}.")
     obj = payload.get("object")
@@ -441,7 +442,7 @@ def resolve_tag(tag: str) -> str:
         if obj.get("type") != "tag" or len(seen) >= 8:
             break
         seen.add(sha)
-        payload = api_json(f"{endpoint}/tags/{sha}")
+        payload = api_json(f"{endpoint}/tags/{sha}", token)
         if not isinstance(payload, dict) or payload.get("sha") != sha:
             break
         obj = payload.get("object")
@@ -686,6 +687,7 @@ def verify_candidate_distfiles(distdir: Path, entries: dict, verified: dict) -> 
 
 def prepare_candidate(
     root: Path, release: dict[str, str], output: Path, *, dry_run: bool = False, summary: Path | None = None,
+    token: str | None = None,
 ) -> dict[str, object]:
     root, output = root.resolve(), output.resolve()
     plan = candidate_plan(root, release)
@@ -716,7 +718,7 @@ def prepare_candidate(
         current_archive = source_distfile(current.version)
         if not retained <= accepted.keys():
             raise AutomationError("Accepted Manifest is missing current package distfiles.")
-        current_commit = resolve_tag(f"v{current.version}")
+        current_commit = resolve_tag(f"v{current.version}", token)
         old_source, _ = download_source(
             current.version, current_commit, work_dir / current_archive, work_dir / "current",
             accepted=accepted[current_archive],
@@ -920,24 +922,52 @@ def apply_handoff(root: Path, bundle: Path, context: dict, artifact_id: str, art
     return report, files
 
 
+class NoApiRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def api_json(url: str, token: str | None = None) -> object:
+    endpoint = urlsplit(url)
+    if (endpoint.scheme, endpoint.netloc) != ("https", "api.github.com"):
+        raise AutomationError("GitHub API requests require https://api.github.com.")
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "spotatui-overlay-release-automation"}
     request = Request(url, headers=headers)
     if token:
         request.add_unredirected_header("Authorization", f"Bearer {token}")
     try:
-        with urlopen(request, timeout=30) as response:
+        with build_opener(NoApiRedirect()).open(request, timeout=30) as response:
+            if response.status != 200:
+                raise AutomationError(f"GitHub GET {url} failed with HTTP {response.status}.")
             return json.load(response)
     except HTTPError as error:
-        raise AutomationError(f"GitHub GET {url} failed with HTTP {error.code}.") from error
-    except (URLError, json.JSONDecodeError) as error:
-        raise AutomationError(f"GitHub GET {url} failed: {error}.") from error
+        error.close()
+        details = []
+        if error.code in (403, 429) and error.headers is not None:
+            digits = r"[0-9]{1,20}"
+            http_date = (r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), [0-9]{2} "
+                         r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+                         r"[0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT")
+            for name, pattern in (
+                ("X-RateLimit-Remaining", digits),
+                ("X-RateLimit-Reset", digits),
+                ("Retry-After", f"{digits}|{http_date}"),
+            ):
+                value = error.headers.get(name, "").strip()
+                if re.fullmatch(pattern, value):
+                    details.append(f"{name}={value}")
+        rate_limit = f" ({', '.join(details)})" if details else ""
+        raise AutomationError(f"GitHub GET {url} failed with HTTP {error.code}{rate_limit}.") from None
+    except URLError:
+        raise AutomationError(f"GitHub GET {url} failed during transport.") from None
+    except (OSError, ValueError, HTTPException):
+        raise AutomationError(f"GitHub GET {url} returned an unreadable response.") from None
 
 
 def discover(root: Path, repository: str, token: str | None) -> dict[str, object]:
     if not REPOSITORY_RE.fullmatch(repository):
         raise AutomationError("GITHUB_REPOSITORY is not in owner/repository form.")
-    payload = api_json(f"{API}/repos/{UPSTREAM}/releases/latest")
+    payload = api_json(f"{API}/repos/{UPSTREAM}/releases/latest", token)
     release = stable_release(payload)
     if release is None:
         return {"outcome": "ignored-release"}
@@ -955,7 +985,7 @@ def discover(root: Path, repository: str, token: str | None) -> dict[str, object
     release_id = payload.get("id")
     if type(release_id) is not int or release_id < 1:
         raise AutomationError("Upstream releases/latest did not return a valid release ID.")
-    release.update(release_id=str(release_id), commit=resolve_tag(release["tag"]))
+    release.update(release_id=str(release_id), commit=resolve_tag(release["tag"], token))
     return {**plan, "release": release}
 
 
@@ -1015,7 +1045,11 @@ def main() -> int:
             dry_run = result.get("dry_run") is True
             if FULL_SHA.fullmatch(args.base_commit) is None:
                 raise AutomationError("Prepare requires a full base commit SHA.")
-            report = prepare_candidate(args.root, release, args.output, dry_run=dry_run, summary=args.summary)
+            # Keep the preparation token out of archive and validation subprocesses.
+            token = os.environ.pop("GH_TOKEN", None)
+            report = prepare_candidate(
+                args.root, release, args.output, dry_run=dry_run, summary=args.summary, token=token,
+            )
             if args.handoff is not None and not dry_run:
                 context = handoff_context(args.base_commit, os.getenv("GITHUB_RUN_ID", ""), os.getenv("GITHUB_RUN_ATTEMPT", ""))
                 with preparation_check(args.summary, "Handoff ZIP"):
