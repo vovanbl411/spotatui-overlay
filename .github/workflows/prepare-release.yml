@@ -22,6 +22,9 @@ concurrency:
 jobs:
   prepare:
     name: Discover, prepare and validate candidate
+    if: >-
+      github.repository == 'vovanbl411/spotatui-overlay' &&
+      github.ref == 'refs/heads/main' && github.workflow_sha == github.sha
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     permissions:
@@ -29,23 +32,26 @@ jobs:
       pull-requests: read
     outputs:
       publish_ready: ${{ steps.ready.outputs.publish_ready }}
-      base_commit: ${{ steps.base.outputs.base_commit }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
     env:
       DRY_RUN: ${{ inputs.dry_run || false }}
+      BASE_COMMIT: ${{ github.workflow_sha }}
+      HANDOFF_NAME: spotatui-release-handoff-${{ github.run_id }}-${{ github.run_attempt }}.zip
       GENTOO_PORTAGE_IMAGE: gentoo/portage@sha256:ce69e5b771bfe9404731e846b835346c34f2c82817ac3626f13af198689a1961
       GENTOO_STAGE3_IMAGE: gentoo/stage3@sha256:d8536e52677e3efe4caf048ca588bc685bc2d24d7fdfc882de1cdc6d38c81d96
     steps:
       - name: Получить main без сохранения credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
+          ref: ${{ github.workflow_sha }}
           persist-credentials: false
 
-      - name: Зафиксировать базовый commit
-        id: base
-        run: echo "base_commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Сверить checkout с ревизией workflow
+        run: test "$(git rev-parse HEAD)" = "$BASE_COMMIT"
 
       - name: Проверить Python-логику
+        id: unit_tests
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_*.py' -v
 
       - name: Найти stable release и проверить повторную обработку
@@ -63,11 +69,10 @@ jobs:
             --github-output "$GITHUB_OUTPUT" \
             "${args[@]}"
 
-      - name: Подготовить кандидат и выполнить Gentoo проверки
+      - name: Подготовить и проверить кандидат в Gentoo
         if: steps.discovery.outputs.outcome == 'release-available' && env.DRY_RUN != 'true'
         env:
-          RELEASE_TAG: ${{ steps.discovery.outputs.release_tag }}
-          BASE_COMMIT: ${{ steps.base.outputs.base_commit }}
+          UNIT_TESTS_RESULT: ${{ steps.unit_tests.outcome }}
         run: |
           set -eu
           docker create --name gentoo-portage "$GENTOO_PORTAGE_IMAGE" /bin/true
@@ -77,107 +82,95 @@ jobs:
             --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/overlay,readonly" \
             --mount "type=bind,src=$RUNNER_TEMP,dst=/runner-temp" \
             --workdir /overlay \
-            --env RELEASE_TAG --env BASE_COMMIT \
-            --env GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
+            --env BASE_COMMIT --env HANDOFF_NAME --env UNIT_TESTS_RESULT \
+            --env GITHUB_RUN_ID --env GITHUB_RUN_ATTEMPT \
+            --env "SUMMARY=/runner-temp/${GITHUB_STEP_SUMMARY#"$RUNNER_TEMP/"}" \
             "$GENTOO_STAGE3_IMAGE" /bin/bash -e -c '
+              echo "Install Gentoo validation tools"
               emerge --oneshot app-portage/pycargoebuild dev-util/pkgcheck
               python3 /overlay/scripts/release_automation.py prepare \
                 --root /overlay --result /runner-temp/release.json \
-                --output /runner-temp/candidate --base-commit "$BASE_COMMIT"
-              DISTDIR=/runner-temp/candidate-work/distfiles \
-                ebuild "/runner-temp/candidate/media-sound/spotatui/spotatui-${RELEASE_TAG#v}.ebuild" manifest
-              python3 /overlay/scripts/release_automation.py check-manifest --root /runner-temp/candidate
-              pkgcheck scan --repo /runner-temp/candidate \
-                --profile default/linux/amd64/23.0 --exit
-              chown -R "$(stat -c %u /overlay):$(stat -c %g /overlay)" /runner-temp/candidate
+                --output /runner-temp/candidate --base-commit "$BASE_COMMIT" \
+                --handoff "/runner-temp/$HANDOFF_NAME" --summary "$SUMMARY" \
+                --unit-tests "$UNIT_TESTS_RESULT"
             '
-          mkdir -p "$RUNNER_TEMP/release-handoff/media-sound/spotatui"
-          cp "$RUNNER_TEMP/candidate/README.md" "$RUNNER_TEMP/release-handoff/README.md"
-          cp "$RUNNER_TEMP/candidate/media-sound/spotatui/Manifest" "$RUNNER_TEMP/release-handoff/media-sound/spotatui/Manifest"
-          cp "$RUNNER_TEMP/candidate/media-sound/spotatui/spotatui-${RELEASE_TAG#v}.ebuild" "$RUNNER_TEMP/release-handoff/media-sound/spotatui/"
-          cp "$RUNNER_TEMP/candidate/release-handoff.json" "$RUNNER_TEMP/release-handoff/release-handoff.json"
-          echo "publish_ready=true" >> "$GITHUB_OUTPUT"
 
-      - name: Загрузить только подготовленные package-файлы
+      - name: Загрузить проверенный handoff
+        id: upload
         if: steps.discovery.outputs.outcome == 'release-available' && env.DRY_RUN != 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: spotatui-release-handoff
-          path: ${{ runner.temp }}/release-handoff
+          path: ${{ runner.temp }}/${{ env.HANDOFF_NAME }}
+          archive: false
           if-no-files-found: error
           retention-days: 1
 
       - name: Отметить handoff готовым
         id: ready
-        if: steps.discovery.outputs.outcome == 'release-available' && env.DRY_RUN != 'true'
-        run: echo "publish_ready=true" >> "$GITHUB_OUTPUT"
+        if: steps.upload.outcome == 'success' && env.DRY_RUN != 'true'
+        env:
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -eu
+          python3 scripts/release_automation.py check-upload \
+            --handoff "$RUNNER_TEMP/$HANDOFF_NAME" \
+            --artifact-id "$ARTIFACT_ID" --artifact-digest "$ARTIFACT_DIGEST"
+          echo "- Handoff ready: artifact $ARTIFACT_ID, SHA-256 $ARTIFACT_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          echo "publish_ready=true" >> "$GITHUB_OUTPUT"
 
   publish:
     name: Publish Draft PR
     needs: prepare
-    if: needs.prepare.outputs.publish_ready == 'true'
+    if: >-
+      needs.prepare.result == 'success' && needs.prepare.outputs.publish_ready == 'true' &&
+      !inputs.dry_run && github.repository == 'vovanbl411/spotatui-overlay' &&
+      github.ref == 'refs/heads/main' && github.workflow_sha == github.sha
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
       pull-requests: write
     steps:
-      - name: Получить актуальный main без сохранения credentials
+      - name: Получить точную ревизию Prepare без сохранения credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
+          ref: ${{ github.workflow_sha }}
           persist-credentials: false
 
-      - name: Скачать handoff текущего запуска
+      - name: Скачать handoff текущего запуска по ID
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: spotatui-release-handoff
-          path: ${{ runner.temp }}/release-handoff
+          artifact-ids: ${{ needs.prepare.outputs.artifact_id }}
+          path: ${{ runner.temp }}/release-download
+          skip-decompress: true
+          digest-mismatch: error
 
-      - name: Проверить base commit и применить allowlisted handoff
+      - name: Проверить remote base и применить проверенный handoff
         id: apply
         env:
-          EXPECTED_BASE: ${{ needs.prepare.outputs.base_commit }}
+          EXPECTED_BASE: ${{ github.workflow_sha }}
+          ARTIFACT_ID: ${{ needs.prepare.outputs.artifact_id }}
+          ARTIFACT_DIGEST: ${{ needs.prepare.outputs.artifact_digest }}
         run: |
           set -eu
-          test "$(git rev-parse HEAD)" = "$EXPECTED_BASE" || {
+          remote="$(git ls-remote --exit-code "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/main)"
+          test "${remote%%$'\t'*}" = "$EXPECTED_BASE" || {
             echo "main moved after preparation; refusing to publish stale candidate" >&2
             exit 1
           }
+          shopt -s nullglob dotglob
+          archives=("$RUNNER_TEMP/release-download/"*)
+          test "${#archives[@]}" = 1 || {
+            echo "Expected one downloaded handoff archive" >&2
+            exit 1
+          }
           python3 scripts/release_automation.py apply \
-            --root "$GITHUB_WORKSPACE" \
-            --handoff "$RUNNER_TEMP/release-handoff" \
+            --root "$GITHUB_WORKSPACE" --handoff "${archives[0]}" \
             --expected-base "$EXPECTED_BASE" \
+            --artifact-id "$ARTIFACT_ID" --artifact-digest "$ARTIFACT_DIGEST" \
             --pull-request-request "$RUNNER_TEMP/pull-request.json" \
             --github-output "$GITHUB_OUTPUT"
-
-      - name: Проверить допустимый список изменений
-        env:
-          HANDOFF_METADATA: ${{ runner.temp }}/release-handoff/release-handoff.json
-        run: |
-          set -eu
-          git diff --check
-          python3 - "$RUNNER_TEMP/pull-request.json" <<'PY'
-          import json, pathlib, subprocess, sys
-          request = json.loads(pathlib.Path(sys.argv[1]).read_text())
-          version = request["head"].removeprefix("automation/spotatui-v")
-          expected = {
-              "README.md",
-              "media-sound/spotatui/Manifest",
-              f"media-sound/spotatui/spotatui-{version}.ebuild",
-          }
-          actual = set(subprocess.check_output(["git", "diff", "--name-only"], text=True).splitlines())
-          untracked = set(subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard"], text=True).splitlines())
-          actual |= untracked
-          removed = set(subprocess.check_output(["git", "diff", "--name-only", "--diff-filter=D"], text=True).splitlines())
-          metadata = json.loads(pathlib.Path(__import__("os").environ["HANDOFF_METADATA"]).read_text())
-          if metadata.get("removed"):
-              expected.add("media-sound/spotatui/" + metadata["removed"])
-          if actual != expected:
-              raise SystemExit(f"Unexpected prepared file set: {sorted(actual ^ expected)}")
-          if removed != ({"media-sound/spotatui/" + metadata["removed"]} if metadata.get("removed") else set()):
-              raise SystemExit("Unexpected ebuild deletion in prepared diff")
-          PY
 
       - name: Создать automation branch и commit
         env:
