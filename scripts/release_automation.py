@@ -4,16 +4,24 @@
 from __future__ import annotations
 
 import argparse
+import gzip
+import hashlib
+import io
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 import tomllib
+import zipfile
+import zlib
+from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -51,7 +59,24 @@ NATIVE_CRATES = frozenset(
         "sdl2-sys",
     }
 )
-ALLOWED_HANDOFF = {"README.md", str(PACKAGE_DIR / "Manifest")}
+ALLOWED_HANDOFF = {str(PACKAGE_DIR / "Manifest")}
+HANDOFF_METADATA = "release-handoff.json"
+FULL_SHA = re.compile(r"[0-9a-f]{40}")
+SHA256 = re.compile(r"[0-9a-f]{64}")
+REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
+PYCARGOEBUILD_VERSION = "0.16.0"
+SOURCE_DECLARATION = (
+    f'SRC_URI="https://github.com/{UPSTREAM}/archive/refs/tags/v${{PV}}.tar.gz'
+    ' -> ${PN}-${PV}.tar.gz\n\t${CARGO_CRATE_URIS}"'
+)
+PREPARATION_CHECKS = (
+    "Source verification",
+    "Cargo contract",
+    "CRATES generation and integrity",
+    "Manifest generation",
+    "Manifest verification",
+    "pkgcheck",
+)
 
 
 class AutomationError(RuntimeError):
@@ -96,7 +121,7 @@ def stable_release(payload: object) -> dict[str, str] | None:
         raise AutomationError("GitHub release is missing its tag or URL.")
     version = Version.parse(tag)
     expected = f"https://github.com/{UPSTREAM}/releases/tag/{tag}"
-    if url != expected:
+    if tag != f"v{version}" or url != expected:
         raise AutomationError("GitHub release URL does not match the upstream tag.")
     return {"tag": f"v{version}", "version": str(version), "url": url}
 
@@ -195,22 +220,28 @@ def reachable_cargo_features(manifest: dict, roots: set[str]) -> set[str]:
 
     return reachable
 
-def native_dependency_map(manifest: dict) -> dict[str, str]:
-    result: dict[str, str] = {}
+def native_dependency_map(manifest: dict) -> dict[tuple[str, str, str], str]:
+    result: dict[tuple[str, str, str], str] = {}
 
-    def visit(value: object) -> None:
-        if not isinstance(value, dict):
-            return
-        for name, specification in value.items():
-            if name in NATIVE_CRATES or NATIVE_CRATE_RE.search(name):
-                result[name] = json.dumps(specification, sort_keys=True)
+    def visit(target: str, tables: dict) -> None:
+        for kind in ("dependencies", "build-dependencies"):
+            dependencies = tables.get(kind)
+            if not isinstance(dependencies, dict):
+                continue
+            for name, specification in dependencies.items():
+                package = specification.get("package", name) if isinstance(specification, dict) else name
+                if any(
+                    item in NATIVE_CRATES or NATIVE_CRATE_RE.search(item)
+                    for item in (name, package) if isinstance(item, str)
+                ):
+                    result[target, kind, name] = json.dumps(specification, sort_keys=True)
 
-    visit(manifest.get("dependencies"))
-    visit(manifest.get("build-dependencies"))
-    for target in manifest.get("target", {}).values() if isinstance(manifest.get("target"), dict) else ():
-        if isinstance(target, dict):
-            visit(target.get("dependencies"))
-            visit(target.get("build-dependencies"))
+    visit("", manifest)
+    targets = manifest.get("target")
+    if isinstance(targets, dict):
+        for target, tables in targets.items():
+            if isinstance(tables, dict):
+                visit(target, tables)
     return result
 
 
@@ -272,8 +303,17 @@ def check_source_contract(
             "Upstream Cargo features changed; review the USE mapping manually: "
             + ", ".join(changed) + "."
         )
-    if native_dependency_map(old_manifest) != native_dependency_map(new_manifest):
-        raise AutomationError("Native/system Cargo dependencies changed; review Gentoo dependencies manually.")
+    old_native, new_native = native_dependency_map(old_manifest), native_dependency_map(new_manifest)
+    if old_native != new_native:
+        changed_native = [
+            f"{target or 'all targets'} / {kind} / {name}"
+            for target, kind, name in sorted(old_native.keys() | new_native.keys())
+            if old_native.get((target, kind, name)) != new_native.get((target, kind, name))
+        ]
+        raise AutomationError(
+            "Native/system Cargo dependencies changed; review Gentoo dependencies manually: "
+            + ", ".join(changed_native) + "."
+        )
     git_dependencies = sorted(
         f"{item.get('name')}@{item.get('version')}"
         for item in lock_packages
@@ -339,11 +379,15 @@ def lock_crates(source_dir: Path) -> set[str]:
         source = str(item["source"])
         if source.startswith("git+"):
             raise AutomationError(f"Cargo.lock contains an unsupported Git dependency: {item.get('name')}.")
-        if source.startswith("registry+"):
-            crate = f"{item.get('name')}@{item.get('version')}"
-            if not re.fullmatch(r"[A-Za-z0-9_-]+@[A-Za-z0-9.+_-]+", crate):
-                raise AutomationError("Cargo.lock contains an invalid registry crate name or version.")
-            crates.add(crate)
+        if source != REGISTRY:
+            raise AutomationError(f"Cargo.lock contains an unsupported crate source for {item.get('name')}.")
+        name, version = item.get("name"), item.get("version")
+        if not isinstance(name, str) or not isinstance(version, str):
+            raise AutomationError("Cargo.lock contains an invalid registry crate name or version.")
+        crate = f"{name}@{version}"
+        if not re.fullmatch(r"[A-Za-z0-9_-]+@[A-Za-z0-9.+_-]+", crate) or crate in crates:
+            raise AutomationError(f"Cargo.lock contains an invalid or duplicate registry crate: {crate}.")
+        crates.add(crate)
     return crates
 
 
@@ -374,33 +418,175 @@ def check_crate_licenses(ebuild: str, generated: str) -> None:
         )
 
 
-def release_dependencies(old_source: Path, new_source: Path) -> tuple[list[str], list[str]]:
-    old = lock_crates(old_source)
-    new = lock_crates(new_source)
-    return sorted(new - old), sorted(old - new)
+def source_url(tag: str) -> str:
+    return f"https://github.com/{UPSTREAM}/archive/refs/tags/{tag}.tar.gz"
 
 
-def _download_source(tag: str, destination: Path) -> Path:
-    url = f"https://github.com/{UPSTREAM}/archive/refs/tags/{quote(tag)}.tar.gz"
-    request = Request(url, headers={"User-Agent": "spotatui-overlay-release-automation"})
-    destination.mkdir(parents=True, exist_ok=True)
-    archive = destination / f"{tag}.tar.gz"
+def resolve_tag(tag: str) -> str:
+    if tag != f"v{Version.parse(tag)}":
+        raise AutomationError(f"Noncanonical upstream tag: {tag}.")
+    endpoint = f"{API}/repos/{UPSTREAM}/git"
+    ref = f"refs/tags/{tag}"
+    payload = api_json(f"{endpoint}/ref/tags/{tag}")
+    if not isinstance(payload, dict) or payload.get("ref") != ref:
+        raise AutomationError(f"Upstream tag API did not return {ref}.")
+    obj = payload.get("object")
+    seen = set()
+    while isinstance(obj, dict):
+        sha = obj.get("sha")
+        if not isinstance(sha, str) or FULL_SHA.fullmatch(sha) is None or sha in seen:
+            break
+        if obj.get("type") == "commit":
+            return sha
+        if obj.get("type") != "tag" or len(seen) >= 8:
+            break
+        seen.add(sha)
+        payload = api_json(f"{endpoint}/tags/{sha}")
+        if not isinstance(payload, dict) or payload.get("sha") != sha:
+            break
+        obj = payload.get("object")
+    raise AutomationError(f"Upstream {tag} does not resolve to an unambiguous commit SHA.")
+
+
+def file_sha256(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def distfile_integrity(path: Path) -> dict[str, int | str]:
+    if not stat.S_ISREG(path.lstat().st_mode):
+        raise AutomationError(f"Distfile is not a regular file: {path.name}.")
+    hashes = {"BLAKE2B": hashlib.blake2b(), "SHA512": hashlib.sha512()}
+    size = 0
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            size += len(block)
+            for digest in hashes.values():
+                digest.update(block)
+    return {"size": size, **{key: digest.hexdigest() for key, digest in hashes.items()}}
+
+
+def valid_distfile_evidence(entry: object) -> bool:
+    return (
+        isinstance(entry, dict)
+        and entry.keys() == {"size", "BLAKE2B", "SHA512"}
+        and type(entry["size"]) is int
+        and entry["size"] > 0
+        and all(isinstance(entry[key], str) and re.fullmatch(r"[0-9a-f]{128}", entry[key])
+                for key in ("BLAKE2B", "SHA512"))
+    )
+
+
+def manifest_distfiles(text: str) -> dict[str, dict[str, int | str]]:
+    entries = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if (len(fields) != 7 or fields[0] != "DIST"
+                or re.fullmatch(r"[A-Za-z0-9_.+-]+", fields[1]) is None
+                or fields[1] in entries or re.fullmatch(r"[0-9]{1,20}", fields[2]) is None):
+            raise AutomationError("Invalid or duplicate DIST entry in thin Manifest.")
+        entry = {
+            "size": int(fields[2]),
+            fields[3]: fields[4].lower(),
+            fields[5]: fields[6].lower(),
+        }
+        if not valid_distfile_evidence(entry):
+            raise AutomationError(f"Invalid Gentoo Manifest digests for {fields[1]}.")
+        entries[fields[1]] = entry
+    return entries
+
+
+def source_distfile(version: str | Version) -> str:
+    return f"spotatui-{version}.tar.gz"
+
+
+def extract_source(archive: Path, destination: Path, version: Version, commit: str) -> Path:
+    prefix = f"spotatui-{version}"
     try:
-        with urlopen(request, timeout=60) as response, archive.open("wb") as output:
-            shutil.copyfileobj(response, output)
-        with tarfile.open(archive, "r:gz") as bundle:
-            bundle.extractall(destination / tag, filter="data")
-    except (HTTPError, URLError, OSError, tarfile.TarError) as error:
-        raise AutomationError(f"Unable to download/extract upstream {tag}: {error}.") from error
-    sources = list((destination / tag).glob("*/Cargo.toml"))
-    if len(sources) != 1:
-        raise AutomationError(f"Expected one upstream Cargo.toml in {tag} archive; found {len(sources)}.")
-    return sources[0].parent
+        with tempfile.TemporaryFile(dir=destination.parent) as raw, gzip.open(archive, "rb") as compressed:
+            for block in iter(lambda: compressed.read(1024 * 1024), b""):
+                if raw.tell() + len(block) > 256 * 1024 * 1024:
+                    raise AutomationError(f"Source tar for v{version} is too large.")
+                raw.write(block)
+            raw.seek(0)
+            with tarfile.open(fileobj=raw, mode="r:") as bundle:
+                if bundle.pax_headers.get("comment") != commit:
+                    raise AutomationError(f"Source archive commit does not match v{version} ({commit}).")
+                paths = set()
+                for member in bundle:
+                    parts = member.name.split("/")
+                    if (parts[0] != prefix or set(parts) & {"", ".", ".."}
+                            or member.name in paths
+                            or member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE)
+                            or "\\" in member.name or (len(parts) == 1 and not member.isdir())):
+                        raise AutomationError(f"Unexpected path or type in source archive v{version}: {member.name!r}.")
+                    paths.add(member.name)
+                raw.seek(bundle.offset)
+                if raw.read(1024) != bytes(1024) or any(
+                    any(block) for block in iter(lambda: raw.read(65536), b"")
+                ):
+                    raise AutomationError(f"Source tar for v{version} has an invalid terminator or trailing data.")
+                if bundle.pax_headers.get("comment") != commit:
+                    raise AutomationError(f"Source archive commit changed within v{version}.")
+                for name in ("Cargo.toml", "Cargo.lock"):
+                    if not bundle.getmember(f"{prefix}/{name}").isfile():
+                        raise AutomationError(f"Source archive v{version} does not contain a regular {name}.")
+                bundle.extractall(destination, filter="data")
+    except (EOFError, KeyError, OSError, tarfile.TarError, zlib.error) as error:
+        raise AutomationError(f"Source archive v{version} failed gzip/tar verification: {error}.") from error
+    return destination / prefix
 
 
-def _current_upstream_version(root: Path) -> Version:
-    current = packaged_versions(root)[-1]
-    return current.version
+def download_source(
+    version: Version, commit: str, archive: Path, destination: Path, *, accepted: dict | None = None,
+) -> tuple[Path, dict[str, int | str]]:
+    tag = f"v{version}"
+    url = source_url(tag)
+    effective = run_checked(
+        f"Download upstream {tag}",
+        ["curl", "--disable", "--fail", "--silent", "--show-error", "--location", "--max-redirs", "3",
+         "--proto", "=https", "--proto-redir", "=https", "--max-time", "180", "--max-filesize", "67108864",
+         "--output", str(archive), "--write-out", "%{url_effective}", url],
+        capture_output=True,
+    ).stdout
+    if effective not in {
+        url, f"https://codeload.github.com/{UPSTREAM}/tar.gz/refs/tags/{tag}",
+        f"https://codeload.github.com/{UPSTREAM}/tar.gz/{tag}",
+    }:
+        raise AutomationError(f"Noncanonical GitHub archive URL for {tag}.")
+    evidence = distfile_integrity(archive)
+    if accepted is not None and evidence != accepted:
+        raise AutomationError(f"Packaged source {tag} does not match the accepted Manifest.")
+    return extract_source(archive, destination, version, commit), evidence
+
+
+def run_checked(operation: str, command: list[str], **kwargs) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(command, check=True, text=True, **kwargs)
+    except FileNotFoundError as error:
+        raise AutomationError(f"{operation}: {command[0]} is unavailable.") from error
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or error.stdout or "").strip()
+        context = f": {detail[-2000:]}" if detail else "."
+        raise AutomationError(f"{operation} failed (exit {error.returncode}){context}") from error
+
+
+def summarize(summary: Path | None, message: str) -> None:
+    print(message, flush=True)
+    if summary is not None:
+        with summary.open("a", encoding="utf-8") as stream:
+            stream.write(f"- {message}\n")
+
+
+@contextmanager
+def preparation_check(summary: Path | None, name: str):
+    print(f"{name}: starting", flush=True)
+    try:
+        yield
+    except (AutomationError, OSError) as error:
+        summarize(summary, f"{name}: failed ({error})")
+        raise
+    summarize(summary, f"{name}: passed")
 
 
 def _generated_crates(source_dir: Path, temp_dir: Path, base_ebuild: str) -> set[str]:
@@ -415,33 +601,23 @@ def _generated_crates(source_dir: Path, temp_dir: Path, base_ebuild: str) -> set
     license_mapping = portdir / "metadata/license-mapping.conf"
     if not license_mapping.is_file():
         raise AutomationError(f"Gentoo license mapping is unavailable: {license_mapping}.")
-    try:
-        subprocess.run(
-            [
-                "pycargoebuild",
-                "--no-config",
-                "--no-manifest",
-                # "--fill-crates",
-                "--distdir",
-                str(distdir),
-                "--license-mapping",
-                str(license_mapping),
-                "--input",
-                str(input_ebuild),
-                "--output",
-                str(generated),
-                str(source_dir),
-            ],
-            check=True,
-            cwd=temp_dir,
-            text=True,
-            capture_output=True,
-        )
-    except FileNotFoundError as error:
-        raise AutomationError("Gentoo app-portage/pycargoebuild is required to update CRATES.") from error
-    except subprocess.CalledProcessError as error:
-        detail = (error.stderr or error.stdout or "").strip()
-        raise AutomationError(f"pycargoebuild failed: {detail[-1500:]}") from error
+    version = run_checked(
+        "Read pycargoebuild version",
+        [sys.executable, "-c", "from pycargoebuild import __version__; print(__version__)"],
+        cwd=temp_dir, capture_output=True,
+    ).stdout.strip()
+    if version != PYCARGOEBUILD_VERSION:
+        raise AutomationError(f"Unreviewed pycargoebuild version {version}; expected {PYCARGOEBUILD_VERSION}.")
+    # 0.16.0 verifies registry SHA-256 from Cargo.lock with these flags.
+    run_checked(
+        "pycargoebuild CRATES generation and checksum verification",
+        [
+            "pycargoebuild", "--no-config", "--no-manifest", "--distdir", str(distdir),
+            "--license-mapping", str(license_mapping), "--input", str(input_ebuild),
+            "--output", str(generated), str(source_dir),
+        ],
+        cwd=temp_dir, capture_output=True,
+    )
     generated_content = generated.read_text(encoding="utf-8")
     check_crate_licenses(base_ebuild, generated_content)
     generated_crates = crates_from_ebuild(generated_content)
@@ -475,223 +651,287 @@ def candidate_plan(root: Path, release: dict[str, str]) -> dict[str, object]:
     }
 
 
+def crate_distfiles(crates: set[str]) -> set[str]:
+    names = {f"{crate.replace('@', '-')}.crate" for crate in crates}
+    if len(crates) != len(names):
+        raise AutomationError("Cargo crate entries collide on a distfile name.")
+    return names
+
+
+def version_distfiles(version: PackagedVersion) -> set[str]:
+    content = version.path.read_text(encoding="utf-8")
+    if re.findall(r'^SRC_URI="[^"]*"', content, re.MULTILINE) != [SOURCE_DECLARATION]:
+        raise AutomationError(f"{version.path.name}: unexpected source URL or distfile declaration.")
+    return crate_distfiles(crates_from_ebuild(content)) | {source_distfile(version.version)}
+
+
+def check_candidate_manifest(
+    entries: dict, accepted: dict, retained: set[str], candidate: set[str], archive: str, archive_evidence: dict,
+) -> None:
+    expected_names = retained | candidate
+    if entries.keys() != expected_names:
+        raise AutomationError(f"Candidate Manifest has unexpected or missing distfiles: {sorted(entries.keys() ^ expected_names)[:8]}.")
+    for name in sorted(retained):
+        if name not in accepted or entries[name] != accepted[name]:
+            raise AutomationError(f"Candidate Manifest changed the accepted fallback digest for {name}.")
+    if entries.get(archive) != archive_evidence:
+        raise AutomationError(f"Candidate Manifest does not match the verified source archive {archive}.")
+
+
+def verify_candidate_distfiles(distdir: Path, entries: dict, verified: dict) -> None:
+    for name, evidence in verified.items():
+        if entries.get(name) != evidence or distfile_integrity(distdir / name) != evidence:
+            raise AutomationError(f"Candidate distfile changed during Manifest generation: {name}.")
+
+
 def prepare_candidate(
-    root: Path,
-    release: dict[str, str],
-    output: Path,
-    *,
-    source_dirs: tuple[Path, Path] | None = None,
-    dry_run: bool = False,
+    root: Path, release: dict[str, str], output: Path, *, dry_run: bool = False, summary: Path | None = None,
 ) -> dict[str, object]:
-    """Prepare only package ebuilds, README and Manifest in an isolated tree."""
+    root, output = root.resolve(), output.resolve()
     plan = candidate_plan(root, release)
     if plan["outcome"] != "release-available" or dry_run:
         return plan
     if output.exists():
         raise AutomationError(f"Candidate output directory already exists: {output}.")
-    version = Version.parse(str(plan["version"]))
-    existing = packaged_versions(root)
-    current = existing[-1]
+    commit = release.get("commit", "")
+    release_id = release.get("release_id", "")
+    if (not isinstance(commit, str) or FULL_SHA.fullmatch(commit) is None
+            or not isinstance(release_id, str) or re.fullmatch(r"[1-9][0-9]*", release_id) is None):
+        raise AutomationError("Candidate release is missing its immutable discovery identity.")
+    version = Version.parse(release["version"])
+    current = packaged_versions(root)[-1]
+    current_ebuild = current.path.read_text(encoding="utf-8")
     work_dir = output.with_name(output.name + "-work")
     if work_dir.exists():
         raise AutomationError(f"Preparation work directory already exists: {work_dir}.")
-    work_dir.mkdir(parents=True)
-    mapped_features = configured_cargo_features(current.path.read_text(encoding="utf-8"))
-    if source_dirs is None:
-        current_source = _download_source(f"v{current.version}", work_dir / "current-source")
-        candidate_source = _download_source(release["tag"], work_dir / "candidate-source")
-        check_source_contract(current_source, candidate_source, current.version, version, mapped_features)
-        return _materialize(root, release, output, plan, current, existing, current_source, candidate_source, work_dir)
-    current_source, candidate_source = source_dirs
-    check_source_contract(current_source, candidate_source, current.version, version, mapped_features)
-    return _materialize(root, release, output, plan, current, existing, current_source, candidate_source, work_dir)
+    distdir = work_dir / "distfiles"
+    distdir.mkdir(parents=True)
+    archive_name = source_distfile(version)
+    archive_path = distdir / archive_name
+    manifest_path = PACKAGE_DIR / "Manifest"
 
+    with preparation_check(summary, "Source verification"):
+        retained = version_distfiles(current)
+        accepted = manifest_distfiles((root / manifest_path).read_text(encoding="utf-8"))
+        current_archive = source_distfile(current.version)
+        if not retained <= accepted.keys():
+            raise AutomationError("Accepted Manifest is missing current package distfiles.")
+        current_commit = resolve_tag(f"v{current.version}")
+        old_source, _ = download_source(
+            current.version, current_commit, work_dir / current_archive, work_dir / "current",
+            accepted=accepted[current_archive],
+        )
+        source, archive_evidence = download_source(version, commit, archive_path, work_dir / "candidate")
+        cargo_toml_sha256 = file_sha256(source / "Cargo.toml")
+        cargo_lock_sha256 = file_sha256(source / "Cargo.lock")
+        summarize(summary, f"Verified v{version} at {commit}, archive SHA512 {archive_evidence['SHA512']}")
 
-def _materialize(
-    root: Path,
-    release: dict[str, str],
-    output: Path,
-    plan: dict[str, object],
-    current: PackagedVersion,
-    existing: list[PackagedVersion],
-    current_source: Path,
-    candidate_source: Path,
-    temporary: Path,
-) -> dict[str, object]:
-    # Изолированная копия содержит только данные, нужные для Manifest/pkgcheck.
-    if output.exists():
-        raise AutomationError(f"Candidate output directory already exists: {output}.")
-    output.mkdir(parents=True)
+    with preparation_check(summary, "Cargo contract"):
+        check_source_contract(old_source, source, current.version, version, configured_cargo_features(current_ebuild))
+        current_crates = crates_from_ebuild(current_ebuild)
+        if current_crates != lock_crates(old_source):
+            raise AutomationError("The accepted CRATES do not match the verified comparison Cargo.lock.")
+        locked_crates = lock_crates(source)
+
+    with preparation_check(summary, "CRATES generation and integrity"):
+        generated = _generated_crates(source, work_dir, current_ebuild)
+        if (generated != locked_crates or file_sha256(source / "Cargo.lock") != cargo_lock_sha256
+                or file_sha256(source / "Cargo.toml") != cargo_toml_sha256):
+            raise AutomationError("CRATES generation did not preserve the verified Cargo inputs.")
+        candidate_names = crate_distfiles(generated) | {archive_name}
+        # Bridge pycargoebuild's successful lock checksum check to Portage's Manifest algorithms.
+        verified = {name: distfile_integrity(distdir / name) for name in sorted(candidate_names)}
+        if verified[archive_name] != archive_evidence:
+            raise AutomationError("The verified candidate source archive changed during CRATES generation.")
+        summarize(summary, f"pycargoebuild {PYCARGOEBUILD_VERSION} verified {len(generated)} registry crates")
+
     for relative in (
-        Path("metadata/layout.conf"),
-        Path("profiles/categories"),
-        Path("profiles/repo_name"),
-        PACKAGE_DIR / "metadata.xml",
-        PACKAGE_DIR / "Manifest",
+        Path("metadata/layout.conf"), Path("profiles/categories"), Path("profiles/repo_name"),
+        PACKAGE_DIR / "metadata.xml", manifest_path, current.path.relative_to(root),
     ):
         destination = output / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(root / relative, destination)
-    package_out = output / PACKAGE_DIR
-    for entry in (root / PACKAGE_DIR).glob("spotatui-*.ebuild"):
-        if entry.name != plan["removed"]:
-            shutil.copy2(entry, package_out / entry.name)
-    generated_crates = _generated_crates(
-        candidate_source, temporary, current.path.read_text(encoding="utf-8")
-    )
-    archive_candidates = list(temporary.rglob(f"{release['tag']}.tar.gz"))
-    if archive_candidates:
-        shutil.copy2(archive_candidates[-1], temporary / "distfiles" / f"spotatui-{plan['version']}.tar.gz")
-    candidate_content = replace_crates(current.path.read_text(encoding="utf-8"), generated_crates)
-    candidate_path = package_out / str(plan["candidate"])
-    candidate_path.write_text(candidate_content, encoding="utf-8")
-    if plan["removed"]:
-        (package_out / str(plan["removed"])).unlink(missing_ok=True)
-    readme = (root / "README.md").read_text(encoding="utf-8")
-    old_version = str(current.version)
-    readme, count = re.subn(
-        rf"(клиент `spotatui` версии ){re.escape(old_version)}(?=\.)",
-        rf"\g<1>{plan['version']}",
-        readme,
-        count=1,
-    )
-    if count != 1:
-        raise AutomationError("README package version line was not found exactly once.")
-    (output / "README.md").write_text(readme, encoding="utf-8")
-    report = {
+
+    candidate_path = output / PACKAGE_DIR / str(plan["candidate"])
+    candidate_path.write_text(replace_crates(current_ebuild, generated), encoding="utf-8")
+    with preparation_check(summary, "Manifest generation"):
+        run_checked(
+            "Portage ebuild manifest", ["ebuild", str(candidate_path), "manifest"],
+            env={**os.environ, "DISTDIR": str(distdir)}, cwd=output,
+        )
+
+    with preparation_check(summary, "Manifest verification"):
+        check_manifest(output)
+        entries = manifest_distfiles((output / manifest_path).read_text(encoding="utf-8"))
+        check_candidate_manifest(entries, accepted, retained, candidate_names, archive_name, archive_evidence)
+        verify_candidate_distfiles(distdir, entries, verified)
+
+    files = {
+        name: file_sha256(output / name)
+        for name in sorted(ALLOWED_HANDOFF | {str(candidate_path.relative_to(output))})
+    }
+    with preparation_check(summary, "pkgcheck"):
+        run_checked(
+            "pkgcheck metadata scan",
+            ["pkgcheck", "scan", "--repo", str(output), "--profile", "default/linux/amd64/23.0", "--exit"],
+            cwd=output,
+        )
+        if any(file_sha256(output / name) != digest for name, digest in files.items()):
+            raise AutomationError("pkgcheck changed the files awaiting handoff.")
+
+    return {
         **plan,
         "tag": release["tag"],
+        "release_id": release_id,
         "release_url": release["url"],
-        "fallback_version": str(current.version) + (f"-r{current.revision}" if current.revision else ""),
-        "base_files": [str(path.relative_to(root)) for path in (root / PACKAGE_DIR / "Manifest", current.path)],
+        "upstream_commit": commit,
+        "source_url": source_url(release["tag"]),
+        "archive": archive_evidence,
+        "cargo_toml_sha256": cargo_toml_sha256,
+        "cargo_lock_sha256": cargo_lock_sha256,
+        "crate_added": sorted(generated - current_crates),
+        "crate_removed": sorted(current_crates - generated),
+        "pycargoebuild_version": PYCARGOEBUILD_VERSION,
+        "validation": dict.fromkeys(PREPARATION_CHECKS, "passed"),
+        "files": files,
     }
-    report["crate_added"], report["crate_removed"] = release_dependencies(current_source, candidate_source)
-    (output / "release-handoff.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    return report
 
 
-def validate_handoff(root: Path, handoff: Path, expected_base: str) -> dict[str, object]:
-    """Reject changed base commits, unsafe archive paths, or unexpected files."""
-    metadata_path = handoff / "release-handoff.json"
-    try:
-        if metadata_path.stat().st_size > 1024 * 1024:
-            raise AutomationError("Release handoff metadata exceeds the size limit.")
-        report = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise AutomationError("Release handoff metadata is missing or invalid.") from error
-    if not isinstance(report, dict) or report.get("base_commit") != expected_base:
-        raise AutomationError("Release handoff base commit does not match the checked-out base.")
-    version = Version.parse(str(report.get("version", "")))
-    tag = report.get("tag")
-    release_url = report.get("release_url")
-    if tag != f"v{version}" or release_url != f"https://github.com/{UPSTREAM}/releases/tag/v{version}":
-        raise AutomationError("Release handoff upstream tag or URL is invalid.")
-    allowed = set(ALLOWED_HANDOFF)
-    allowed.add(str(PACKAGE_DIR / f"spotatui-{version}.ebuild"))
-    fallback = report.get("fallback")
-    if not isinstance(fallback, str) or EBUILD_RE.fullmatch(fallback) is None:
-        raise AutomationError("Release handoff has an invalid fallback ebuild.")
-    removed = report.get("removed")
-    if removed is not None:
-        if not isinstance(removed, str) or EBUILD_RE.fullmatch(removed) is None:
-            raise AutomationError("Release handoff has an invalid removed ebuild.")
-    actual: set[str] = set()
-    for path in handoff.rglob("*"):
-        if path.is_symlink():
-            raise AutomationError("Release handoff contains a symlink.")
-        if path.is_file():
-            relative = path.relative_to(handoff).as_posix()
-            if relative != "release-handoff.json":
-                actual.add(relative)
-    if actual != allowed:
-        raise AutomationError(f"Release handoff file allowlist mismatch: {sorted(actual ^ allowed)}.")
-    if expected_base != "" and not re.fullmatch(r"[0-9a-f]{40}", expected_base):
+def handoff_context(base: str, run_id: str, run_attempt: str) -> dict[str, str]:
+    if FULL_SHA.fullmatch(base) is None:
         raise AutomationError("Expected base commit is not a full Git SHA.")
-    return report
+    if any(re.fullmatch(r"[1-9][0-9]*", value) is None for value in (run_id, run_attempt)):
+        raise AutomationError("Handoff requires the workflow run ID and attempt.")
+    return {"base_commit": base, "run_id": run_id, "run_attempt": run_attempt}
 
 
-def apply_handoff(root: Path, handoff: Path, expected_base: str) -> dict[str, object]:
-    report = validate_handoff(root, handoff, expected_base)
-    release = {
-        "tag": f"v{report['version']}",
-        "version": str(report["version"]),
-        "url": str(report["release_url"]),
-    }
-    expected_plan = candidate_plan(root, release)
-    for key in ("outcome", "version", "candidate", "fallback", "removed"):
-        if report.get(key) != expected_plan.get(key):
-            raise AutomationError(f"Release handoff {key} does not match the current base tree.")
-    for relative in ("README.md", str(PACKAGE_DIR / "Manifest"), str(PACKAGE_DIR / report["candidate"])):
-        source = handoff / relative
-        destination = root / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
-    if report.get("removed"):
-        (root / PACKAGE_DIR / str(report["removed"])).unlink()
-    report["branch"] = f"automation/spotatui-v{report['version']}"
-    report["title"] = f"[release-bump] spotatui v{report['version']}"
-    report["body"] = pull_request_body(report)
-    return report
+def mandatory_results() -> dict[str, str]:
+    return dict.fromkeys(("Python unit tests", *PREPARATION_CHECKS), "passed")
 
 
-def pull_request_body(report: dict[str, object]) -> str:
-    added = report.get("crate_added", [])
-    removed = report.get("crate_removed", [])
-    lines = [
-        f"# spotatui release [{report['tag']}]({report['release_url']})",
-        "",
-        "## Package rotation",
-        "",
-        f"- Candidate: `{report['candidate']}`",
-        f"- Fallback retained: `{report['fallback']}`",
-    ]
-    if report.get("removed"):
-        lines.append(f"- Older fallback removed: `{report['removed']}`")
-    lines.extend(["", "## Cargo dependency changes", ""])
-    lines.append(f"- Added registry crates: {len(added)}")
-    lines.append(f"- Removed registry crates: {len(removed)}")
-    if added:
-        lines.extend(["", "Added:", "", *[f"- `{item}`" for item in added]])
-    if removed:
-        lines.extend(["", "Removed:", "", *[f"- `{item}`" for item in removed]])
-    lines.extend(
-        [
-            "",
-            "## Automated checks",
-            "",
-            "- Stable GitHub release tag matches upstream `Cargo.toml` package.version.",
-            "- Existing USE mapping, backend, Gentoo dependencies, patches, Cargo feature map, crate licenses, and native Cargo integration were checked for compatibility.",
-            "- `pycargoebuild` refreshed CRATES from the release Cargo.lock.",
-            "- Manifest generated; CRATES/Manifest consistency and `pkgcheck scan --profile default/linux/amd64/23.0 --exit` passed.",
-            "- Python automation unit tests passed.",
-            "- No client build or runtime test is claimed by these metadata checks.",
-            "",
-            "## Manual gates before accepting",
-            "",
-            "- [ ] Review upstream release notes and the full ebuild/Manifest diff.",
-            "- [ ] Check whether Cargo changes require new Gentoo system dependencies or packaging decisions.",
-            "- [ ] Run `emerge -pv media-sound/spotatui` and build the candidate with the intended USE flags.",
-            "- [ ] Test Spotify and enabled optional features at runtime.",
-            "- [ ] Manually accept the Draft PR when review is complete.",
-            "",
-            "GitHub Actions uses `GITHUB_TOKEN`; its push and Draft PR creation do not trigger a second workflow run. Preparation ran the required checks in this workflow.",
-        ]
+def write_handoff(candidate: Path, bundle: Path, report: dict, context: dict, unit_tests: str) -> None:
+    if unit_tests != "success" or report.get("validation") != dict.fromkeys(PREPARATION_CHECKS, "passed"):
+        raise AutomationError("Handoff requires successful results from all mandatory checks.")
+    names = ALLOWED_HANDOFF | {str(PACKAGE_DIR / report["candidate"])}
+    files = {name: (candidate / name).read_bytes() for name in sorted(names)}
+    if {name: hashlib.sha256(data).hexdigest() for name, data in files.items()} != report["files"]:
+        raise AutomationError("Candidate files changed after validation.")
+    metadata = {**report, **context, "validation": mandatory_results()}
+    files[HANDOFF_METADATA] = (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode()
+    with zipfile.ZipFile(bundle, "x") as archive:
+        for name, data in files.items():
+            member = zipfile.ZipInfo(name)
+            member.create_system = 3
+            member.external_attr = (stat.S_IFREG | 0o644) << 16
+            archive.writestr(member, data, compress_type=zipfile.ZIP_DEFLATED)
+
+
+def check_upload(bundle: Path, artifact_id: str, artifact_digest: str) -> bytes:
+    if re.fullmatch(r"[1-9][0-9]*", artifact_id) is None:
+        raise AutomationError("Upload did not return a valid artifact ID.")
+    expected = artifact_digest.removeprefix("sha256:")
+    if SHA256.fullmatch(expected) is None:
+        raise AutomationError("Upload did not return a valid artifact SHA-256.")
+    if not stat.S_ISREG(bundle.lstat().st_mode):
+        raise AutomationError("Downloaded handoff is not a regular file.")
+    size_limit = 8 * 1024 * 1024
+    with bundle.open("rb") as stream:
+        payload = stream.read(size_limit + 1)
+    if len(payload) > size_limit or hashlib.sha256(payload).hexdigest() != expected:
+        raise AutomationError("Handoff archive does not match the trusted artifact digest.")
+    return payload
+
+
+def validate_handoff(root: Path, bundle: Path, context: dict, artifact_id: str, artifact_digest: str) -> tuple[dict, dict[str, bytes]]:
+    payload = check_upload(bundle, artifact_id, artifact_digest)
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            members = archive.infolist()
+            if len(members) != 3 or len({member.filename for member in members}) != 3:
+                raise AutomationError("Release handoff file allowlist mismatch.")
+            for member in members:
+                if (member.orig_filename != member.filename or member.create_system != 3
+                        or (member.external_attr >> 16) != (stat.S_IFREG | 0o644)
+                        or member.file_size > 4 * 1024 * 1024 or member.flag_bits & 1):
+                    raise AutomationError(f"Unexpected file type or size in handoff: {member.filename!r}.")
+            report = json.loads(archive.read(HANDOFF_METADATA))
+            if not isinstance(report, dict) or any(report.get(key) != value for key, value in context.items()):
+                raise AutomationError("Handoff base commit, run ID or attempt does not match Prepare.")
+            if report.get("validation") != mandatory_results():
+                raise AutomationError("Handoff is missing successful mandatory checks.")
+            version = Version.parse(str(report.get("version", "")))
+            tag = f"v{version}"
+            release = {"tag": tag, "version": str(version), "url": str(report.get("release_url", ""))}
+            expected_plan = candidate_plan(root, release)
+            if expected_plan["outcome"] != "release-available" or any(
+                report.get(key) != value for key, value in expected_plan.items()
+            ):
+                raise AutomationError("Release handoff rotation plan does not match the current base tree.")
+            allowed = ALLOWED_HANDOFF | {str(PACKAGE_DIR / expected_plan["candidate"])}
+            if {member.filename for member in members} != allowed | {HANDOFF_METADATA}:
+                raise AutomationError("Release handoff file allowlist mismatch.")
+            files = {name: archive.read(name) for name in sorted(allowed)}
+    except (KeyError, UnicodeError, json.JSONDecodeError, zipfile.BadZipFile, NotImplementedError, zlib.error) as error:
+        raise AutomationError(f"Invalid release handoff ZIP or metadata: {error}.") from error
+
+    if (report.get("tag") != tag or report.get("source_url") != source_url(tag)
+            or FULL_SHA.fullmatch(str(report.get("upstream_commit", ""))) is None
+            or re.fullmatch(r"[1-9][0-9]*", str(report.get("release_id", ""))) is None
+            or report.get("pycargoebuild_version") != PYCARGOEBUILD_VERSION
+            or any(SHA256.fullmatch(str(report.get(key, ""))) is None
+                   for key in ("cargo_toml_sha256", "cargo_lock_sha256"))
+            or not valid_distfile_evidence(report.get("archive"))):
+        raise AutomationError("Handoff upstream or Cargo identity is invalid.")
+    if report.get("files") != {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}:
+        raise AutomationError("Handoff file contents do not match the validated digests.")
+
+    current = packaged_versions(root)[-1]
+    current_ebuild = current.path.read_text(encoding="utf-8")
+    candidate_ebuild = files[str(PACKAGE_DIR / expected_plan["candidate"])].decode()
+    crates = crates_from_ebuild(candidate_ebuild)
+    if candidate_ebuild != replace_crates(current_ebuild, crates):
+        raise AutomationError("Handoff ebuild changes the accepted packaging outside CRATES.")
+    current_crates = crates_from_ebuild(current_ebuild)
+    if report.get("crate_added") != sorted(crates - current_crates) or report.get("crate_removed") != sorted(current_crates - crates):
+        raise AutomationError("Handoff crate changes do not match the ebuild diff.")
+    manifest_path = PACKAGE_DIR / "Manifest"
+    archive_name = source_distfile(version)
+    check_candidate_manifest(
+        manifest_distfiles(files[str(manifest_path)].decode()),
+        manifest_distfiles((root / manifest_path).read_text(encoding="utf-8")),
+        version_distfiles(current), crate_distfiles(crates) | {archive_name}, archive_name, report["archive"],
     )
-    return "\n".join(lines)
+    return report, files
+
+
+def apply_handoff(root: Path, bundle: Path, context: dict, artifact_id: str, artifact_digest: str) -> tuple[dict, dict[str, bytes]]:
+    report, files = validate_handoff(root, bundle, context, artifact_id, artifact_digest)
+    candidate = root / PACKAGE_DIR / report["candidate"]
+    manifest = root / PACKAGE_DIR / "Manifest"
+    if not stat.S_ISREG(manifest.lstat().st_mode):
+        raise AutomationError("Handoff target Manifest is not a regular file.")
+    # Exclusive creation also rejects ignored files and dangling symlinks.
+    with candidate.open("xb") as stream:
+        stream.write(files[str(candidate.relative_to(root))])
+    manifest.write_bytes(files[str(manifest.relative_to(root))])
+    if report["removed"]:
+        (root / PACKAGE_DIR / report["removed"]).unlink()
+    return report, files
 
 
 def api_json(url: str, token: str | None = None) -> object:
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "spotatui-overlay-release-automation"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
     request = Request(url, headers=headers)
+    if token:
+        request.add_unredirected_header("Authorization", f"Bearer {token}")
     try:
         with urlopen(request, timeout=30) as response:
             return json.load(response)
     except HTTPError as error:
-        raise AutomationError(f"GitHub API request failed with HTTP {error.code}.") from error
+        raise AutomationError(f"GitHub GET {url} failed with HTTP {error.code}.") from error
     except (URLError, json.JSONDecodeError) as error:
-        raise AutomationError(f"GitHub API request failed: {error}.") from error
+        raise AutomationError(f"GitHub GET {url} failed: {error}.") from error
 
 
 def discover(root: Path, repository: str, token: str | None) -> dict[str, object]:
@@ -712,11 +952,11 @@ def discover(root: Path, repository: str, token: str | None) -> dict[str, object
         raise AutomationError("GitHub returned an invalid pull request list.")
     if pulls:
         return {"outcome": "already-processed", "release": release, "branch": branch}
-    return {**plan, "release": release, "branch": branch}
-
-
-def write_output(path: Path, key_values: dict[str, object]) -> None:
-    path.write_text("".join(f"{key}={str(value).lower()}\n" for key, value in key_values.items()), encoding="utf-8")
+    release_id = payload.get("id")
+    if type(release_id) is not int or release_id < 1:
+        raise AutomationError("Upstream releases/latest did not return a valid release ID.")
+    release.update(release_id=str(release_id), commit=resolve_tag(release["tag"]))
+    return {**plan, "release": release}
 
 
 def main() -> int:
@@ -737,13 +977,13 @@ def main() -> int:
     prep.add_argument("--result", type=Path, required=True)
     prep.add_argument("--output", type=Path, required=True)
     prep.add_argument("--base-commit", required=True)
-    prep.add_argument("--dry-run", action="store_true")
-    apply = subparsers.add_parser("apply")
-    apply.add_argument("--root", type=Path, default=Path.cwd())
-    apply.add_argument("--handoff", type=Path, required=True)
-    apply.add_argument("--expected-base", required=True)
-    apply.add_argument("--pull-request-request", type=Path, required=True)
-    apply.add_argument("--github-output", type=Path)
+    prep.add_argument("--handoff", type=Path)
+    prep.add_argument("--summary", type=Path)
+    prep.add_argument("--unit-tests", default="")
+    upload = subparsers.add_parser("check-upload")
+    upload.add_argument("--handoff", type=Path, required=True)
+    upload.add_argument("--artifact-id", required=True)
+    upload.add_argument("--artifact-digest", required=True)
     args = parser.parse_args()
     try:
         if args.command == "check-manifest":
@@ -754,13 +994,14 @@ def main() -> int:
             result["dry_run"] = args.dry_run
             args.result.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
             if args.github_output:
-                write_output(args.github_output, {"outcome": result["outcome"], "release_tag": result.get("release", {}).get("tag", "") if isinstance(result.get("release"), dict) else "", "available": result["outcome"] == "release-available"})
+                args.github_output.write_text(f"outcome={result['outcome']}\n", encoding="utf-8")
             if args.summary:
                 args.summary.write_text(
                     "## spotatui release discovery\n\n"
                     f"- Outcome: `{result['outcome']}`\n"
                     + (f"- Upstream: {result['release']['url']}\n" if isinstance(result.get("release"), dict) else "")
-                    + (f"- Candidate: `{result['version']}`\n- Fallback: `{result['fallback']}`\n" if result.get("outcome") == "release-available" else "")
+                    + (f"- Candidate: `{result['version']}` at `{result['release']['commit']}`\n"
+                       f"- Fallback: `{result['fallback']}`\n" if result.get("outcome") == "release-available" else "")
                     + ("- Dry run: no source preparation or publication was performed.\n" if args.dry_run else ""),
                     encoding="utf-8",
                 )
@@ -771,29 +1012,23 @@ def main() -> int:
             release = result.get("release")
             if not isinstance(release, dict) or result.get("outcome") != "release-available":
                 raise AutomationError("No new stable release is available for preparation.")
-            report = prepare_candidate(args.root, release, args.output, dry_run=args.dry_run)
-            report["base_commit"] = args.base_commit
-            if not args.dry_run:
-                handoff = args.output / "release-handoff.json"
-                handoff.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+            dry_run = result.get("dry_run") is True
+            if FULL_SHA.fullmatch(args.base_commit) is None:
+                raise AutomationError("Prepare requires a full base commit SHA.")
+            report = prepare_candidate(args.root, release, args.output, dry_run=dry_run, summary=args.summary)
+            if args.handoff is not None and not dry_run:
+                context = handoff_context(args.base_commit, os.getenv("GITHUB_RUN_ID", ""), os.getenv("GITHUB_RUN_ATTEMPT", ""))
+                with preparation_check(args.summary, "Handoff ZIP"):
+                    write_handoff(args.output, args.handoff, report, context, args.unit_tests)
             print(json.dumps(report, indent=2))
             return 0
-        if args.command == "apply":
-            report = apply_handoff(args.root, args.handoff, args.expected_base)
-            request = {
-                "base": "main",
-                "body": report["body"],
-                "draft": True,
-                "head": report["branch"],
-                "title": report["title"],
-            }
-            args.pull_request_request.write_text(json.dumps(request) + "\n", encoding="utf-8")
-            if args.github_output:
-                write_output(args.github_output, {"branch": report["branch"], "tag": report["tag"], "candidate": report["version"]})
-            print(json.dumps({key: report[key] for key in ("branch", "title", "version")}, indent=2))
+        if args.command == "check-upload":
+            check_upload(args.handoff, args.artifact_id, args.artifact_digest)
             return 0
-    except (AutomationError, OSError, json.JSONDecodeError) as error:
-        print(f"Release automation error: {error}", file=sys.stderr)
+    except (AutomationError, OSError, UnicodeError, json.JSONDecodeError) as error:
+        if args.command == "discover" and args.summary:
+            summarize(args.summary, f"Discover: failed ({error})")
+        print(f"Release automation {args.command}: {error}", file=sys.stderr)
         return 1
     return 2
 

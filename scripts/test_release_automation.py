@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import gzip
+import hashlib
+import io
 import json
+import stat
+import tarfile
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts import release_automation as automation
 
@@ -24,6 +31,7 @@ class ReleaseAutomationTests(unittest.TestCase):
         crates_block = "\n".join(f"\t{crate}" for crate in crate_entries)
         path.write_text(
             f'EAPI=8\nCRATES="\n{crates_block}\n"\nIUSE="mpris"\n'
+            f'{automation.SOURCE_DECLARATION}\nLICENSE="MIT"\n'
             f'RDEPEND="mpris? ( sys-apps/dbus )"\n'
             f'src_configure() {{\n local -a myfeatures=( tui streaming )\n'
             f' use mpris && myfeatures+=( mpris )\n}}\n# {version}\n',
@@ -244,6 +252,23 @@ class ReleaseAutomationTests(unittest.TestCase):
                     old, new, automation.Version(1, 2, 3), automation.Version(1, 2, 4), {"tui"}
                 )
 
+    def test_native_dependency_change_cannot_be_hidden_by_another_target_or_kind(self) -> None:
+        for other_header in ('target."cfg(windows)".dependencies', 'target."cfg(unix)".build-dependencies'):
+            with self.subTest(other_header=other_header), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                old = self.cargo_source(base / "old", "1.2.3")
+                new = self.cargo_source(base / "new", "1.2.4")
+                for source, version in ((old, "0.3"), (new, "0.4")):
+                    with (source / "Cargo.toml").open("a", encoding="utf-8") as cargo:
+                        cargo.write(
+                            f'\n[target."cfg(unix)".dependencies]\nalsa-sys="{version}"\n'
+                            f'[{other_header}]\nalsa-sys="0.5"\n'
+                        )
+                with self.assertRaisesRegex(automation.AutomationError, "Native/system Cargo"):
+                    automation.check_source_contract(
+                        old, new, automation.Version(1, 2, 3), automation.Version(1, 2, 4), {"tui"}
+                    )
+
     def test_tag_and_package_version_must_match(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -282,39 +307,272 @@ class ReleaseAutomationTests(unittest.TestCase):
                     old, new, automation.Version(1, 2, 3), automation.Version(1, 2, 4), {"tui"}
                 )
 
-    def make_handoff(self) -> tuple[Path, Path, str]:
+    def test_discover_resolves_lightweight_and_annotated_release_tags(self) -> None:
+        tag = "v1.2.4"
+        ref = f"refs/tags/{tag}"
+        release = {"id": 42, "tag_name": tag, "html_url": self.release("1.2.4")["url"],
+                   "draft": False, "prerelease": False}
         self.ebuild("spotatui-1.2.3.ebuild", "1.2.3")
+        commit = {"type": "commit", "sha": "a" * 40}
+        annotation = {"type": "tag", "sha": "b" * 40}
+        for reference, objects in ((commit, []), (annotation, [{"sha": "b" * 40, "object": commit}])):
+            with self.subTest(kind=reference["type"]), patch.object(
+                automation, "api_json", side_effect=[release, [], {"ref": ref, "object": reference}, *objects],
+            ) as api:
+                result = automation.discover(self.root, "owner/repo", "read-token")
+                self.assertEqual(result["release"]["commit"], commit["sha"])
+                self.assertEqual(result["release"]["release_id"], "42")
+                self.assertTrue(api.call_args_list[2].args[0].endswith("/git/ref/tags/v1.2.4"))
+
+    def test_invalid_tag_objects_are_rejected(self) -> None:
+        tag = "v1.2.4"
+        ref = f"refs/tags/{tag}"
+        for responses in (
+            [{"ref": "refs/tags/v1.2.5", "object": {"type": "commit", "sha": "a" * 40}}],
+            [{"ref": ref, "object": {"type": "commit", "sha": "123"}}],
+            [{"ref": ref, "object": {"type": "tree", "sha": "a" * 40}}],
+            [{"ref": ref, "object": {"type": "tag", "sha": "b" * 40}},
+             {"sha": "c" * 40, "object": {"type": "commit", "sha": "a" * 40}}],
+            [{"ref": ref, "object": {"type": "tag", "sha": "b" * 40}},
+             {"sha": "b" * 40, "object": {"type": "tag", "sha": "b" * 40}}],
+        ):
+            with self.subTest(responses=responses), patch.object(automation, "api_json", side_effect=responses):
+                with self.assertRaises(automation.AutomationError):
+                    automation.resolve_tag(tag)
+
+    def source_tar(self, extra: tarfile.TarInfo | None = None) -> bytes:
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode="w", pax_headers={"comment": "a" * 40}) as archive:
+            for name in ("Cargo.toml", "Cargo.lock"):
+                data = b"test"
+                member = tarfile.TarInfo(f"spotatui-1.2.4/{name}")
+                member.size = len(data)
+                archive.addfile(member, io.BytesIO(data))
+            if extra is not None:
+                archive.addfile(extra)
+        return raw.getvalue()
+
+    def test_source_archive_checks_commit_and_entire_stream(self) -> None:
+        version = automation.Version.parse("1.2.4")
+        archive = self.root / "source.tar.gz"
+        raw = self.source_tar()
+        compressed = gzip.compress(raw, mtime=0)
+        archive.write_bytes(compressed)
+        source = automation.extract_source(archive, self.root / "valid", version, "a" * 40)
+        self.assertEqual((source / "Cargo.lock").read_bytes(), b"test")
+        for data, commit, message in (
+            (compressed, "b" * 40, "commit"),
+            (compressed[:-4], "a" * 40, "gzip/tar"),
+            (gzip.compress(raw[:-1024] + b"X" * 1024), "a" * 40, "terminator or trailing data"),
+        ):
+            with self.subTest(message=message):
+                archive.write_bytes(data)
+                with self.assertRaisesRegex(automation.AutomationError, message):
+                    automation.extract_source(archive, self.root / "invalid", version, commit)
+                self.assertFalse((self.root / "invalid").exists())
+
+    def test_source_archive_rejects_unexpected_paths_and_file_types(self) -> None:
+        version = automation.Version.parse("1.2.4")
+        archive = self.root / "source.tar.gz"
+        link = tarfile.TarInfo("spotatui-1.2.4/link")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "Cargo.toml"
+        for entry in (tarfile.TarInfo("spotatui-1.2.4/../outside"), link,
+                      tarfile.TarInfo("spotatui-1.2.4/Cargo.lock")):
+            with self.subTest(name=entry.name):
+                archive.write_bytes(gzip.compress(self.source_tar(entry), mtime=0))
+                with self.assertRaisesRegex(automation.AutomationError, "Unexpected path or type"):
+                    automation.extract_source(archive, self.root / "invalid", version, "a" * 40)
+                self.assertFalse((self.root / "invalid").exists())
+
+    def test_baseline_archive_must_match_accepted_manifest_before_extraction(self) -> None:
+        archive = self.root / "source.tar.gz"
+        archive.write_bytes(gzip.compress(self.source_tar(), mtime=0))
+        result = type("Download", (), {"stdout": automation.source_url("v1.2.4")})()
+        with patch.object(automation, "run_checked", return_value=result):
+            with self.assertRaisesRegex(automation.AutomationError, "accepted Manifest"):
+                automation.download_source(
+                    automation.Version.parse("1.2.4"), "a" * 40, archive, self.root / "extract",
+                    accepted=self.distfile_evidence(b"different"),
+                )
+        self.assertFalse((self.root / "extract").exists())
+
+    def test_dry_run_does_not_download_or_create_a_candidate(self) -> None:
+        self.ebuild("spotatui-1.2.3.ebuild", "1.2.3")
+        output = self.root / "candidate"
+        with patch.object(automation, "download_source") as download, patch.object(automation, "run_checked") as command:
+            plan = automation.prepare_candidate(self.root, self.release("1.2.4"), output, dry_run=True)
+        self.assertEqual(plan["outcome"], "release-available")
+        self.assertFalse(output.exists())
+        download.assert_not_called()
+        command.assert_not_called()
+
+    @staticmethod
+    def distfile_evidence(data: bytes) -> dict:
+        return {"size": len(data), "BLAKE2B": hashlib.blake2b(data).hexdigest(), "SHA512": hashlib.sha512(data).hexdigest()}
+
+    @staticmethod
+    def manifest(entries: dict) -> str:
+        return "".join(
+            f"DIST {name} {entry['size']} BLAKE2B {entry['BLAKE2B']} SHA512 {entry['SHA512']}\n"
+            for name, entry in sorted(entries.items())
+        )
+
+    def make_handoff(self) -> tuple[Path, Path, dict, dict]:
+        old = self.ebuild("spotatui-1.2.3.ebuild", "1.2.3")
         release = self.release("1.2.4")
+        base = self.distfile_evidence(b"packaged source")
+        shared = self.distfile_evidence(b"verified shared crate")
+        source = self.distfile_evidence(b"verified source")
+        previous = {"spotatui-1.2.3.tar.gz": base, "serde-1.0.0.crate": shared}
+        (self.package / "Manifest").write_text(self.manifest(previous), encoding="utf-8")
         report = {
             **automation.candidate_plan(self.root, release),
             "tag": release["tag"],
+            "release_id": "42",
             "release_url": release["url"],
-            "base_commit": "a" * 40,
+            "upstream_commit": "b" * 40,
+            "source_url": automation.source_url(release["tag"]),
+            "archive": source,
+            "cargo_toml_sha256": "c" * 64,
+            "cargo_lock_sha256": "d" * 64,
+            "crate_added": [],
+            "crate_removed": [],
+            "pycargoebuild_version": automation.PYCARGOEBUILD_VERSION,
+            "validation": dict.fromkeys(automation.PREPARATION_CHECKS, "passed"),
         }
-        handoff = self.root / "handoff"
-        package = handoff / automation.PACKAGE_DIR
+        context = automation.handoff_context("a" * 40, "111", "2")
+        candidate = self.root / "candidate"
+        package = candidate / automation.PACKAGE_DIR
         package.mkdir(parents=True)
-        (handoff / "README.md").write_text("candidate readme\n", encoding="utf-8")
-        (package / "Manifest").write_text("candidate manifest\n", encoding="utf-8")
-        candidate = package / str(report["candidate"])
-        candidate.write_text("candidate ebuild\n", encoding="utf-8")
-        (handoff / "release-handoff.json").write_text(json.dumps(report), encoding="utf-8")
-        return self.root, handoff, "a" * 40
+        (package / "Manifest").write_text(
+            self.manifest({**previous, "spotatui-1.2.4.tar.gz": source}), encoding="utf-8",
+        )
+        (package / report["candidate"]).write_text(
+            automation.replace_crates(old.read_text(), {"serde@1.0.0"}), encoding="utf-8",
+        )
+        names = automation.ALLOWED_HANDOFF | {str(automation.PACKAGE_DIR / report["candidate"])}
+        report["files"] = {name: automation.file_sha256(candidate / name) for name in names}
+        return candidate, self.root / "handoff.zip", context, report
 
     def test_publisher_rejects_unallowlisted_handoff_file(self) -> None:
-        root, handoff, base = self.make_handoff()
-        (handoff / ".github").mkdir()
-        (handoff / ".github/workflows.yml").write_text("untrusted\n", encoding="utf-8")
-        with self.assertRaisesRegex(automation.AutomationError, "allowlist mismatch"):
-            automation.validate_handoff(root, handoff, base)
+        candidate, bundle, context, report = self.make_handoff()
+        automation.write_handoff(candidate, bundle, report, context, "success")
+        for name in ("README.md", ".github/workflows.yml"):
+            with self.subTest(name=name):
+                extra = bundle.with_name(Path(name).name + ".zip")
+                extra.write_bytes(bundle.read_bytes())
+                with zipfile.ZipFile(extra, "a") as archive:
+                    archive.writestr(name, "untrusted\n")
+                with self.assertRaisesRegex(automation.AutomationError, "allowlist mismatch"):
+                    automation.validate_handoff(self.root, extra, context, "77", automation.file_sha256(extra))
 
     def test_publisher_applies_only_validated_candidate_files(self) -> None:
-        root, handoff, base = self.make_handoff()
-        report = automation.apply_handoff(root, handoff, base)
-        self.assertTrue((self.package / "spotatui-1.2.4.ebuild").is_file())
-        self.assertEqual((root / "README.md").read_text(), "candidate readme\n")
-        self.assertEqual(report["branch"], "automation/spotatui-v1.2.4")
-        self.assertIn("Manual gates", report["body"])
+        candidate, bundle, context, report = self.make_handoff()
+        automation.write_handoff(candidate, bundle, report, context, "success")
+        result, files = automation.apply_handoff(self.root, bundle, context, "77", automation.file_sha256(bundle))
+        expected = {str(automation.PACKAGE_DIR / name) for name in (report["candidate"], "Manifest")}
+        with zipfile.ZipFile(bundle) as archive:
+            self.assertEqual(set(archive.namelist()), expected | {automation.HANDOFF_METADATA})
+        self.assertEqual(set(files), expected)
+        self.assertEqual(result["candidate"], "spotatui-1.2.4.ebuild")
+        for name, contents in files.items():
+            self.assertEqual((self.root / name).read_bytes(), contents)
+        self.assertTrue((self.package / result["fallback"]).is_file())
+
+    def test_publisher_rejects_wrong_artifact_digest_id_or_context(self) -> None:
+        candidate, bundle, context, report = self.make_handoff()
+        automation.write_handoff(candidate, bundle, report, context, "success")
+        digest = automation.file_sha256(bundle)
+        for expected, artifact_id, expected_digest, error in (
+            (context, "", digest, "artifact ID"),
+            (context, "0", digest, "artifact ID"),
+            (context, "77", "e" * 64, "trusted artifact digest"),
+            ({**context, "base_commit": "b" * 40}, "77", digest, "base commit, run ID or attempt"),
+            ({**context, "run_id": "112"}, "77", digest, "base commit, run ID or attempt"),
+            ({**context, "run_attempt": "3"}, "77", digest, "base commit, run ID or attempt"),
+        ):
+            with self.subTest(expected=expected, error=error):
+                with self.assertRaisesRegex(automation.AutomationError, error):
+                    automation.apply_handoff(self.root, bundle, expected, artifact_id, expected_digest)
+                self.assertFalse((self.package / "spotatui-1.2.4.ebuild").exists())
+
+    def test_handoff_requires_every_validation_result_and_unchanged_files(self) -> None:
+        candidate, bundle, context, report = self.make_handoff()
+        for status, validation in (("skipped", report["validation"]), ("success", {}),
+                                    ("success", {**report["validation"], "pkgcheck": "failure"})):
+            with self.subTest(status=status, validation=validation):
+                with self.assertRaisesRegex(automation.AutomationError, "mandatory checks"):
+                    automation.write_handoff(candidate, bundle, {**report, "validation": validation}, context, status)
+                self.assertFalse(bundle.exists())
+        (candidate / automation.PACKAGE_DIR / "Manifest").write_text("changed after pkgcheck")
+        with self.assertRaisesRegex(automation.AutomationError, "changed after validation"):
+            automation.write_handoff(candidate, bundle, report, context, "success")
+        self.assertFalse(bundle.exists())
+
+    def test_publisher_rejects_contract_changes_even_with_matching_content_digests(self) -> None:
+        candidate, bundle, context, report = self.make_handoff()
+        name = str(automation.PACKAGE_DIR / report["candidate"])
+        with (candidate / name).open("a", encoding="utf-8") as ebuild:
+            ebuild.write('IUSE+=" unexpected"\n')
+        report["files"][name] = automation.file_sha256(candidate / name)
+        automation.write_handoff(candidate, bundle, report, context, "success")
+        with self.assertRaisesRegex(automation.AutomationError, "outside CRATES"):
+            automation.apply_handoff(self.root, bundle, context, "77", automation.file_sha256(bundle))
+        self.assertFalse((self.package / report["candidate"]).exists())
+
+    def test_publisher_rejects_tampered_files_and_unexpected_zip_member_types(self) -> None:
+        candidate, bundle, context, report = self.make_handoff()
+        automation.write_handoff(candidate, bundle, report, context, "success")
+        with zipfile.ZipFile(bundle) as original:
+            contents = [(member, original.read(member)) for member in original.infolist()]
+        manifest = str(automation.PACKAGE_DIR / "Manifest")
+        for name, data, mode, error in (
+            (manifest, b"changed", stat.S_IFREG | 0o644, "validated digests"),
+            (manifest, b"Manifest", stat.S_IFLNK | 0o644, "Unexpected file type"),
+            (manifest, b"Manifest", stat.S_IFREG | 0o755, "Unexpected file type"),
+            ("../Manifest", b"changed", stat.S_IFREG | 0o644, "allowlist mismatch"),
+            (automation.HANDOFF_METADATA, None, stat.S_IFREG | 0o644, "mandatory checks"),
+        ):
+            with self.subTest(name=name, error=error):
+                mutated = self.root / f"mutated-{error.replace(' ', '-')}.zip"
+                original_name = automation.HANDOFF_METADATA if data is None else manifest
+                with zipfile.ZipFile(mutated, "w") as archive:
+                    for member, original_data in contents:
+                        if member.filename != original_name:
+                            archive.writestr(member, original_data)
+                    replaced = zipfile.ZipInfo(name)
+                    replaced.create_system = 3
+                    replaced.external_attr = mode << 16
+                    if data is None:
+                        data = json.dumps({**report, **context, "validation": {}}).encode()
+                    archive.writestr(replaced, data)
+                with self.assertRaisesRegex(automation.AutomationError, error):
+                    automation.validate_handoff(self.root, mutated, context, "77", automation.file_sha256(mutated))
+
+    def test_manifest_verifies_retained_candidate_and_shared_distfiles(self) -> None:
+        old_source = self.distfile_evidence(b"old source")
+        new_source = self.distfile_evidence(b"new source")
+        shared = self.distfile_evidence(b"shared crate")
+        retained = {"spotatui-1.2.3.tar.gz", "shared.crate"}
+        candidate = {"spotatui-1.2.4.tar.gz", "shared.crate"}
+        accepted = {"spotatui-1.2.3.tar.gz": old_source, "shared.crate": shared,
+                    "spotatui-1.2.2.tar.gz": old_source}
+        entries = {"spotatui-1.2.3.tar.gz": old_source, "shared.crate": shared,
+                   "spotatui-1.2.4.tar.gz": new_source}
+        automation.check_candidate_manifest(entries, accepted, retained, candidate, "spotatui-1.2.4.tar.gz", new_source)
+        for changed, error in (
+            ({**entries, "spotatui-1.2.2.tar.gz": old_source}, "unexpected or missing"),
+            ({**entries, "shared.crate": new_source}, "accepted fallback"),
+            ({**entries, "spotatui-1.2.4.tar.gz": old_source}, "verified source archive"),
+        ):
+            with self.subTest(error=error), self.assertRaisesRegex(automation.AutomationError, error):
+                automation.check_candidate_manifest(changed, accepted, retained, candidate, "spotatui-1.2.4.tar.gz", new_source)
+        (self.root / "shared.crate").write_bytes(b"shared crate")
+        automation.verify_candidate_distfiles(self.root, entries, {"shared.crate": shared})
+        (self.root / "shared.crate").write_bytes(b"shared cratE")
+        with self.assertRaisesRegex(automation.AutomationError, "changed during Manifest generation"):
+            automation.verify_candidate_distfiles(self.root, entries, {"shared.crate": shared})
 
     def test_cargo_lock_registry_entries_feed_crates_update(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
